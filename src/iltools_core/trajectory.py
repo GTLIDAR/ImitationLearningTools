@@ -1,6 +1,8 @@
 from dataclasses import dataclass
-from typing import Optional, Any, Dict
+from typing import Any, Dict, Optional
+
 import numpy as np
+
 
 @dataclass(slots=True)
 class Trajectory:
