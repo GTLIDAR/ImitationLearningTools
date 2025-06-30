@@ -201,3 +201,66 @@ class ZarrBackedTrajectoryDataset(BaseTrajectoryDataset):
         from iltools_core.metadata_schema import DatasetMeta
 
         return DatasetMeta(**self._metadata)
+
+    def get_window(self, traj_idx: int, start: int, length: int) -> dict:
+        """
+        Efficiently fetch a window of [start:start+length] for a given trajectory index.
+        Returns a dict with 'observations' and 'actions', each a dict of tensors.
+        If the requested window exceeds the trajectory length, it is truncated.
+        """
+        # Find the actual length of this trajectory
+        traj_len = self.lengths[traj_idx]
+        end = min(start + length, traj_len)
+        obs = {
+            k: torch.from_numpy(self.root[f"observations/{k}"][traj_idx, start:end])
+            .float()
+            .to(self.device)
+            for k in self.observation_keys
+        }
+        actions = {
+            k: torch.from_numpy(self.root[f"actions/{k}"][traj_idx, start:end])
+            .float()
+            .to(self.device)
+            for k in self.action_keys
+        }
+        return {"observations": obs, "actions": actions}
+
+    def batch_get(
+        self, traj_indices, step_indices, key: str, data_type: str = "observations"
+    ) -> torch.Tensor:
+        """
+        Efficiently fetch a batch of (traj_idx, step_idx) pairs for a given key and data_type.
+        Args:
+            traj_indices: 1D torch.Tensor or np.ndarray of trajectory indices [N]
+            step_indices: 1D torch.Tensor or np.ndarray of step indices [N]
+            key: observation or action key
+            data_type: 'observations' or 'actions'
+        Returns:
+            torch.Tensor of shape [N, ...] on the correct device
+        """
+        if data_type not in ["observations", "actions"]:
+            raise ValueError(
+                f"data_type must be 'observations' or 'actions', got {data_type}"
+            )
+        arr = self.root.get(f"{data_type}/{key}")
+        if arr is None:
+            raise KeyError(f"Key '{key}' not found in {data_type}")
+        # Convert indices to numpy
+        if isinstance(traj_indices, torch.Tensor):
+            traj_indices = traj_indices.cpu().numpy()
+        if isinstance(step_indices, torch.Tensor):
+            step_indices = step_indices.cpu().numpy()
+        # Advanced indexing workaround for Zarr: loop over pairs
+        result = []
+        for ti, si in zip(traj_indices, step_indices):
+            if ti < 0 or ti >= arr.shape[0]:
+                raise IndexError(
+                    f"Trajectory index {ti} out of bounds for array with shape {arr.shape}"
+                )
+            if si < 0 or si >= arr.shape[1]:
+                raise IndexError(
+                    f"Step index {si} out of bounds for array with shape {arr.shape}"
+                )
+            result.append(arr[ti, si])
+        result = np.stack(result)
+        return torch.from_numpy(result).to(self.device)

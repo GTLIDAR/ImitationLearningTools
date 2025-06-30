@@ -3,7 +3,7 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "imitation-learning-tools"
+name = "iltools"
 version = "0.0.1"
 authors = [{ name = "Feiyang Wu", email = "feiyang.wu@gatech.edu" }]
 description = "Modular toolkit for robot imitation learning"
