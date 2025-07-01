@@ -40,6 +40,7 @@ def export_trajectories_to_zarr(
     out_dir: str,
     num_workers: int = 8,
     window_size: Optional[int] = None,
+    control_freq: Optional[float] = None,
 ):
     """Export trajectories to Zarr format.
 
@@ -48,6 +49,7 @@ def export_trajectories_to_zarr(
         out_dir: The directory to save the exported trajectories.
         num_workers: The number of workers to use for parallel export.
         window_size: The size of the window to use for exporting the trajectories.
+        control_freq: Control frequency to use for all trajectories. If None, uses loader's default.
     """
     os.makedirs(out_dir, exist_ok=True)
     zarr_path = os.path.join(out_dir, "trajectories.zarr")
@@ -63,12 +65,18 @@ def export_trajectories_to_zarr(
     else:
         metadata = dict(loader.metadata)
     metadata["window_size"] = window_size
+    if control_freq is not None:
+        metadata["export_control_freq"] = control_freq
     with open(os.path.join(out_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f)
     store = zarr.DirectoryStore(zarr_path)
     root = zarr.open_group(store=store, mode="w")
     try:
-        first_traj = loader[0]
+        # Get first trajectory with consistent frequency
+        if hasattr(loader, "__getitem__") and control_freq is not None:
+            first_traj = loader.__getitem__(0, control_freq=control_freq)
+        else:
+            first_traj = loader[0]
         first_traj_len = int(next(iter(first_traj.observations.values())).shape[0])
         obs_shapes = {
             k: first_traj.observations[k].shape[1:]
@@ -140,7 +148,11 @@ def export_trajectories_to_zarr(
 
     def process_traj(idx):
         try:
-            traj = loader[int(idx)]
+            # Use consistent frequency for all trajectories
+            if hasattr(loader, "__getitem__") and control_freq is not None:
+                traj = loader.__getitem__(int(idx), control_freq=control_freq)
+            else:
+                traj = loader[int(idx)]
             if window_size is not None:
                 return list(get_windows(traj, window_size))
             else:

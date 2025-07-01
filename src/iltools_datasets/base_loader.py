@@ -20,6 +20,21 @@ class BaseTrajectoryLoader(ABC):
     @property
     @abstractmethod
     def metadata(self) -> DatasetMeta: ...
+
+    def get_frequency_info(self) -> Dict[str, Any]:
+        """
+        Get frequency-related information from the loader.
+        Can be overridden by subclasses to provide more specific info.
+        """
+        info = {}
+        if hasattr(self, "original_freq"):
+            info["original_frequency"] = self.original_freq
+        if hasattr(self, "effective_freq"):
+            info["effective_frequency"] = self.effective_freq
+        if hasattr(self, "default_control_freq"):
+            info["default_control_freq"] = self.default_control_freq
+        return info
+
     def as_dataset(self, **kwargs) -> "BaseTrajectoryDataset":
         raise NotImplementedError
 

@@ -31,15 +31,26 @@ class LocoMuJoCoLoader(BaseTrajectoryLoader):
     Flexible loader for Loco-MuJoCo trajectories.
     """
 
-    def __init__(self, env_name: str, task: str = "walk"):
+    def __init__(
+        self,
+        env_name: str,
+        task: str = "walk",
+        default_control_freq: Optional[float] = None,
+    ):
         self.env_name = env_name
         self.task = task
+        self.default_control_freq = default_control_freq
         self._setup_cache()
         self.env = self._load_env()
-        assert hasattr(self.env, "th") and isinstance(self.env.th, TrajectoryHandler), (
-            "TrajectoryHandler not found in env"
-        )
+        assert hasattr(self.env, "th") and isinstance(
+            self.env.th, TrajectoryHandler
+        ), "TrajectoryHandler not found in env"
         self.th: TrajectoryHandler = self.env.th
+
+        # Store original frequency info
+        self.original_freq = self.th.traj.info.frequency
+        self.effective_freq = self.default_control_freq or self.original_freq
+
         self._metadata = self._discover_metadata()
 
     def _setup_cache(self):
@@ -68,11 +79,38 @@ class LocoMuJoCoLoader(BaseTrajectoryLoader):
         assert isinstance(self.th, TrajectoryHandler), "TrajectoryHandler not found"
         # Get available keys from the TrajectoryData fields
         data_fields = list(vars(self.th.traj.data).keys())
-        obs_keys = [
-            k
-            for k in data_fields
-            if not k.startswith("_") and getattr(self.th.traj.data, k).size > 0
-        ]
+
+        # Filter out structural/metadata fields that shouldn't be treated as observations
+        excluded_fields = {
+            "split_points",
+            "episode_starts",
+            "episode_ends",
+            "time_stamps",
+        }
+
+        obs_keys = []
+        for k in data_fields:
+            if (
+                not k.startswith("_")
+                and k not in excluded_fields
+                and hasattr(self.th.traj.data, k)
+            ):
+                field_value = getattr(self.th.traj.data, k)
+                if (
+                    field_value is not None
+                    and hasattr(field_value, "size")
+                    and field_value.size > 0
+                ):
+                    # Check if the field represents trajectory data by verifying
+                    # its length matches total timesteps across all trajectories
+                    total_timesteps = (
+                        self.th.traj.data.split_points[-1]
+                        if hasattr(self.th.traj.data, "split_points")
+                        else 0
+                    )
+                    if hasattr(field_value, "shape") and len(field_value.shape) >= 1:
+                        if field_value.shape[0] == total_timesteps:
+                            obs_keys.append(k)
         # Try to detect action keys (if present)
         action_keys = None
         if (
@@ -82,6 +120,22 @@ class LocoMuJoCoLoader(BaseTrajectoryLoader):
             if getattr(self.th.traj.transitions, "actions", None) is not None:
                 action_keys = ["actions"]
 
+        # Calculate trajectory lengths at effective frequency
+        trajectory_lengths = []
+        for traj_ind in range(self.th.n_trajectories):
+            if (
+                self.default_control_freq is not None
+                and self.default_control_freq != self.original_freq
+            ):
+                # If using different frequency, need to calculate interpolated length
+                original_length = int(self.th.len_trajectory(traj_ind))
+                original_dt = 1.0 / self.original_freq
+                total_time = original_length * original_dt
+                new_length = int(total_time * self.effective_freq)
+                trajectory_lengths.append(new_length)
+            else:
+                trajectory_lengths.append(int(self.th.len_trajectory(traj_ind)))
+
         return DatasetMeta(
             name=f"loco_mujoco_{self.env_name}_{self.task}",
             source="loco_mujoco",
@@ -90,10 +144,10 @@ class LocoMuJoCoLoader(BaseTrajectoryLoader):
             num_trajectories=self.th.n_trajectories,
             observation_keys=obs_keys,
             action_keys=action_keys,
-            trajectory_lengths=[
-                int(self.th.len_trajectory(traj_ind))
-                for traj_ind in range(self.th.n_trajectories)
-            ],
+            trajectory_lengths=trajectory_lengths,
+            # Add frequency metadata
+            original_frequency=self.original_freq,
+            effective_frequency=self.effective_freq,
         )
 
     @property
@@ -109,17 +163,21 @@ class LocoMuJoCoLoader(BaseTrajectoryLoader):
         """
         Returns a single trajectory as an ImitationLearningTools Trajectory.
         Optionally interpolates to the desired control frequency.
+        If control_freq is None, uses the loader's default_control_freq or original frequency.
         """
+        # Determine effective control frequency
+        effective_control_freq = control_freq or self.effective_freq
+
         # Get the slice for this trajectory
         start = self.th.traj.data.split_points[idx]
         end = self.th.traj.data.split_points[idx + 1]
         length = end - start
 
         # Optionally interpolate
-        if control_freq is not None and control_freq != self.th.traj.info.frequency:
+        if effective_control_freq != self.th.traj.info.frequency:
             # Interpolate using loco-mujoco utility
             new_data, new_info = interpolate_trajectories(
-                self.th.traj.data, self.th.traj.info, control_freq
+                self.th.traj.data, self.th.traj.info, effective_control_freq
             )
             # Slice the interpolated data
             data = new_data
@@ -149,8 +207,7 @@ class LocoMuJoCoLoader(BaseTrajectoryLoader):
                     actions["actions"] = arr[start:end]
 
         # dt (time step)
-        dt = 1.0 / (control_freq if control_freq is not None else info.frequency)
-
+        dt = 1.0 / effective_control_freq
         return ILTTrajectory(
             observations=obs,
             actions=actions,

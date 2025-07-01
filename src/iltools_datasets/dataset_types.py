@@ -82,6 +82,12 @@ class ZarrBackedTrajectoryDataset(BaseTrajectoryDataset):
             self.lengths = [self.lengths] * self._metadata["num_trajectories"]
         self.observation_keys = self._metadata["observation_keys"]
         self.action_keys = self._metadata["action_keys"] or []
+
+        # Store frequency information if available
+        self.export_control_freq = self._metadata.get("export_control_freq")
+        self.original_frequency = self._metadata.get("original_frequency")
+        self.effective_frequency = self._metadata.get("effective_frequency")
+
         self.device = device
         self.pin_memory = pin_memory
         self.batch_size = batch_size
@@ -186,6 +192,52 @@ class ZarrBackedTrajectoryDataset(BaseTrajectoryDataset):
         )
         dt_batch = torch.stack([sample["dt"] for sample in batch])
         return {"observations": obs_batch, "actions": act_batch, "dt": dt_batch}
+
+    def validate_frequency_consistency(self) -> bool:
+        """
+        Validate that all samples have consistent dt values.
+        Returns True if consistent, False otherwise.
+        """
+        if len(self) == 0:
+            return True
+
+        # Sample a few dt values to check consistency
+        sample_indices = [0, min(len(self) - 1, 10), len(self) - 1]
+        dt_values = []
+        for idx in sample_indices:
+            try:
+                dt_val = self.root["dt"][idx]
+                dt_values.append(float(np.asarray(dt_val)))
+            except Exception:
+                return False
+
+        # Check if all dt values are approximately equal
+        if len(dt_values) > 1:
+            return all(abs(dt - dt_values[0]) < 1e-6 for dt in dt_values)
+        return True
+
+    def get_frequency_info(self) -> dict:
+        """
+        Get frequency-related information from the dataset.
+        """
+        info = {
+            "export_control_freq": self.export_control_freq,
+            "original_frequency": self.original_frequency,
+            "effective_frequency": self.effective_frequency,
+            "consistent_dt": self.validate_frequency_consistency(),
+        }
+
+        # Add sample dt value
+        if len(self) > 0:
+            try:
+                sample_dt = float(np.asarray(self.root["dt"][0]))
+                info["sample_dt"] = sample_dt
+                info["sample_frequency"] = 1.0 / sample_dt if sample_dt > 0 else None
+            except Exception:
+                info["sample_dt"] = None
+                info["sample_frequency"] = None
+
+        return info
 
     def shutdown(self):
         self._stop_event.set()
