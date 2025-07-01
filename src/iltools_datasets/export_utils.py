@@ -6,6 +6,7 @@ import zarr
 from typing import Optional
 from iltools_core.metadata_schema import DatasetMeta
 from iltools_datasets.base_loader import BaseTrajectoryLoader
+from tqdm import tqdm
 
 logger = logging.getLogger("iltools_datasets.export_utils")
 
@@ -41,6 +42,8 @@ def export_trajectories_to_zarr(
     num_workers: int = 8,
     window_size: Optional[int] = None,
     control_freq: Optional[float] = None,
+    desired_horizon_steps: Optional[int] = None,
+    horizon_multiplier: float = 2.0,
 ):
     """Export trajectories to Zarr format.
 
@@ -50,6 +53,8 @@ def export_trajectories_to_zarr(
         num_workers: The number of workers to use for parallel export.
         window_size: The size of the window to use for exporting the trajectories.
         control_freq: Control frequency to use for all trajectories. If None, uses loader's default.
+        desired_horizon_steps: The number of steps in the RL environment's episode (e.g., 1000).
+        horizon_multiplier: How many times longer the reference should be (e.g., 2.0 for twice as long).
     """
     os.makedirs(out_dir, exist_ok=True)
     zarr_path = os.path.join(out_dir, "trajectories.zarr")
@@ -104,29 +109,38 @@ def export_trajectories_to_zarr(
     else:
         win_size = int(first_traj_len)
         total_windows = len(loader)
+
+    max_windows = None
+    if desired_horizon_steps is not None and control_freq is not None:
+        total_seconds = (desired_horizon_steps / control_freq) * horizon_multiplier
+        max_windows = int(total_seconds * control_freq)
+        max_windows = min(max_windows, total_windows)
+    else:
+        max_windows = total_windows
+
     obs_arrays = {}
     for k in loader.metadata.observation_keys:
         obs_arrays[k] = root.create_dataset(
             f"observations/{k}",
-            shape=(int(total_windows), win_size, *obs_shapes[k]),
+            shape=(int(max_windows), win_size, *obs_shapes[k]),
             dtype=obs_dtypes[k],
-            chunks=(min(1024, int(total_windows)), win_size, *obs_shapes[k]),
+            chunks=(min(1024, int(max_windows)), win_size, *obs_shapes[k]),
             compressor=zarr.Blosc(cname="zstd", clevel=3, shuffle=2),
         )
     act_arrays = {}
     for k in loader.metadata.action_keys or []:
         act_arrays[k] = root.create_dataset(
             f"actions/{k}",
-            shape=(int(total_windows), win_size, *act_shapes[k]),
+            shape=(int(max_windows), win_size, *act_shapes[k]),
             dtype=act_dtypes[k],
-            chunks=(min(1024, int(total_windows)), win_size, *act_shapes[k]),
+            chunks=(min(1024, int(max_windows)), win_size, *act_shapes[k]),
             compressor=zarr.Blosc(cname="zstd", clevel=3, shuffle=2),
         )
     dt_array = root.create_dataset(
         "dt",
-        shape=(int(total_windows),),
+        shape=(int(max_windows),),
         dtype=np.float32,
-        chunks=(min(1024, int(total_windows)),),
+        chunks=(min(1024, int(max_windows)),),
         compressor=zarr.Blosc(),
     )
 
@@ -166,20 +180,22 @@ def export_trajectories_to_zarr(
             executor.submit(process_traj, int(idx)): int(idx)
             for idx in range(len(loader))
         }
-        for fut in concurrent.futures.as_completed(fut_to_idx):
-            idx = int(fut_to_idx[fut])
-            try:
-                res = fut.result()
-                results.append((idx, res))
-            except Exception as e:
-                logger.error(f"Export failed for trajectory {idx}: {e}")
-    flat_results = []
-    for idx, winlist in sorted(results):
-        flat_results.extend(winlist)
-    for i, (obs, act, dt) in enumerate(flat_results):
-        for k, arr in obs.items():
-            obs_arrays[k][int(i), ...] = np.asarray(arr)
-        for k, arr in act.items():
-            act_arrays[k][int(i), ...] = np.asarray(arr)
-        dt_array[int(i)] = np.float32(dt)
-    logger.info(f"Exported {len(flat_results)} windows/trajectories to {zarr_path}")
+        window_counter = 0
+        for fut in tqdm(
+            concurrent.futures.as_completed(fut_to_idx),
+            total=len(fut_to_idx),
+            desc="Processing trajectories",
+        ):
+            traj_windows = fut.result()
+            for obs_win, act_win, dt in traj_windows:
+                if window_counter >= max_windows:
+                    break
+                for k in loader.metadata.observation_keys:
+                    obs_arrays[k][window_counter] = obs_win[k]
+                for k in loader.metadata.action_keys or []:
+                    act_arrays[k][window_counter] = act_win[k]
+                dt_array[window_counter] = dt
+                window_counter += 1
+            if window_counter >= max_windows:
+                break
+    logger.info(f"Exported {len(traj_windows)} windows/trajectories to {zarr_path}")

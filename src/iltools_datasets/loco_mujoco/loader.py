@@ -1,4 +1,3 @@
-import logging
 import os
 from functools import lru_cache
 from typing import Any, Dict, Iterator, List, Optional
@@ -20,10 +19,6 @@ from iltools_datasets.base_loader import (
     BaseTrajectoryDataset,
     BaseTrajectoryLoader,
 )
-
-# --- Set up logging ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("loco_mujoco.loader")
 
 
 class LocoMuJoCoLoader(BaseTrajectoryLoader):
@@ -177,7 +172,7 @@ class LocoMuJoCoLoader(BaseTrajectoryLoader):
         if effective_control_freq != self.th.traj.info.frequency:
             # Interpolate using loco-mujoco utility
             new_data, new_info = interpolate_trajectories(
-                self.th.traj.data, self.th.traj.info, effective_control_freq
+                self.th.traj.data, self.th.traj.info, effective_control_freq, backend=np
             )
             # Slice the interpolated data
             data = new_data
