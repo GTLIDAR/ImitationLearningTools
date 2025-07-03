@@ -3,6 +3,7 @@ import json
 import queue
 import threading
 from functools import lru_cache
+from typing import Dict, Any, Union, List
 
 import numpy as np
 import torch
@@ -21,6 +22,7 @@ class DiskBackedTrajectoryDataset(BaseTrajectoryDataset):
         self.observation_keys = self._metadata["observation_keys"]
         self.action_keys = self._metadata["action_keys"] or []
         self.device = device
+        self.dt_list = self._metadata["dt"]
         self._get_traj = lru_cache(maxsize=cache_size)(self._get_traj_uncached)
 
     def __len__(self):
@@ -30,7 +32,7 @@ class DiskBackedTrajectoryDataset(BaseTrajectoryDataset):
         d = self._get_traj(idx)
         d["observations"] = {k: v.to(self.device) for k, v in d["observations"].items()}
         d["actions"] = {k: v.to(self.device) for k, v in d["actions"].items()}
-        d["dt"] = d["dt"].to(self.device)
+        # d["dt"] = d["dt"].to(self.device)
         return d
 
     def _get_traj_uncached(self, idx):
@@ -44,7 +46,7 @@ class DiskBackedTrajectoryDataset(BaseTrajectoryDataset):
         actions = {
             k: torch.from_numpy(data[k]).float() for k in self.action_keys if k in data
         }
-        dt = float(data["dt"])
+        dt = float(self.dt_list[idx])
         return {
             "observations": obs,
             "actions": actions,
@@ -64,134 +66,98 @@ class DiskBackedTrajectoryDataset(BaseTrajectoryDataset):
 
 
 class ZarrBackedTrajectoryDataset(BaseTrajectoryDataset):
-    def __init__(
-        self,
-        data_dir,
-        window_size=None,
-        device="cpu",
-        pin_memory=False,
-        prefetch_batches=4,
-        batch_size=1,
-    ):
+    """Dataset that reads from per-trajectory Zarr format.
+
+    Each trajectory is stored as a separate Zarr group:
+    trajectories.zarr/traj_XXXX/observations/{key}, actions/{key}
+    """
+
+    def __init__(self, data_dir: str, device: str = "cpu"):
         self.data_dir = data_dir
-        self.zarr_path = os.path.join(data_dir, "trajectories.zarr")
+        self.device = device
+
+        # Load global metadata
         with open(os.path.join(data_dir, "metadata.json"), "r") as f:
             self._metadata = json.load(f)
+
         self.lengths = self._metadata["trajectory_lengths"]
         if isinstance(self.lengths, int):
             self.lengths = [self.lengths] * self._metadata["num_trajectories"]
+
         self.observation_keys = self._metadata["observation_keys"]
         self.action_keys = self._metadata["action_keys"] or []
+        self.dt_list = self._metadata["dt"]
 
-        # Store frequency information if available
-        self.export_control_freq = self._metadata.get("export_control_freq")
-        self.original_frequency = self._metadata.get("original_frequency")
-        self.effective_frequency = self._metadata.get("effective_frequency")
+        # Open Zarr store
+        zarr_path = os.path.join(data_dir, "trajectories.zarr")
+        store = zarr.DirectoryStore(zarr_path)
+        self.root = zarr.open_group(store=store, mode="r")
 
-        self.device = device
-        self.pin_memory = pin_memory
-        self.batch_size = batch_size
-        self.prefetch_batches = prefetch_batches
-        if self.zarr_path is None or not isinstance(self.zarr_path, str):
-            raise RuntimeError(
-                f"self.zarr_path must be a non-None string, got {self.zarr_path}"
+    def __len__(self) -> int:
+        return len(self.lengths)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        traj_group = self.root[f"traj_{idx:04d}"]
+
+        # Load observations
+        obs_dict = {}
+        obs_group = traj_group["observations"]
+        for key in self.observation_keys:
+            obs_dict[key] = torch.tensor(
+                np.array(obs_group[key]), dtype=torch.float32, device=self.device
             )
-        self.root = zarr.open(self.zarr_path, mode="r")
-        dt_arr = self.root["dt"]
-        shape0 = dt_arr.shape[0]
-        if isinstance(shape0, int):
-            self.length = shape0
-        else:
-            try:
-                self.length = int(np.asarray(shape0))
-            except Exception:
-                raise RuntimeError(
-                    f"Could not convert dt_arr.shape[0] to int: {shape0}"
+
+        # Load actions (if present)
+        act_dict = {}
+        if self.action_keys and "actions" in traj_group:
+            act_group = traj_group["actions"]
+            for key in self.action_keys:
+                act_dict[key] = torch.tensor(
+                    np.array(act_group[key]), dtype=torch.float32, device=self.device
                 )
-        self._queue = queue.Queue(maxsize=prefetch_batches)
-        self._stop_event = threading.Event()
-        self._next_idx = 0
-        self._prefetch_thread = threading.Thread(
-            target=self._prefetch_loop, daemon=True
-        )
-        self._prefetch_thread.start()
 
-    def __len__(self):
-        return self.length
-
-    def _prefetch_loop(self):
-        while not self._stop_event.is_set():
-            if self._queue.full():
-                self._stop_event.wait(0.01)
-                continue
-            batch = []
-            for _ in range(self.batch_size):
-                if self._next_idx >= self.length:
-                    self._next_idx = 0
-                try:
-                    sample = self._get_item(self._next_idx)
-                    batch.append(sample)
-                except Exception as e:
-                    pass
-                self._next_idx += 1
-            if batch:
-                self._queue.put(batch)
-
-    def __getitem__(self, idx):
-        return self._get_item(idx)
-
-    def get_batch(self):
-        try:
-            batch = self._queue.get(timeout=5)
-            return self._collate_batch(batch)
-        except queue.Empty:
-            batch = [
-                self._get_item((self._next_idx + i) % self.length)
-                for i in range(self.batch_size)
-            ]
-            self._next_idx = (self._next_idx + self.batch_size) % self.length
-            return self._collate_batch(batch)
-
-    def _get_item(self, idx):
-        obs = {
-            k: torch.from_numpy(self.root[f"observations/{k}"][int(idx)]).float()
-            for k in self.observation_keys
-        }
-        actions = {
-            k: torch.from_numpy(self.root[f"actions/{k}"][int(idx)]).float()
-            for k in self.action_keys
-        }
-        dt_val = self.root["dt"][int(idx)]
-        dt = float(np.asarray(dt_val))
-        for d in [obs, actions]:
-            for k, v in d.items():
-                if self.pin_memory:
-                    v = v.pin_memory()
-                v = v.to(self.device)
-                d[k] = v
         return {
-            "observations": obs,
-            "actions": actions,
-            "dt": torch.tensor(dt, dtype=torch.float32, device=self.device),
+            **obs_dict,
+            **act_dict,
+            "dt": torch.tensor(
+                float(self.dt_list[idx]), dtype=torch.float32, device=self.device
+            ),
         }
 
-    def _collate_batch(self, batch):
-        obs_keys = self.observation_keys
-        act_keys = self.action_keys
-        obs_batch = {
-            k: torch.stack([sample["observations"][k] for sample in batch])
-            for k in obs_keys
+    def get_trajectory_slice(
+        self, idx: int, start: int = None, end: int = None
+    ) -> Dict[str, Any]:
+        """Get a slice of a trajectory without loading the entire trajectory."""
+        traj_group = self.root[f"traj_{idx:04d}"]
+
+        # Load observations slice
+        obs_dict = {}
+        obs_group = traj_group["observations"]
+        for key in self.observation_keys:
+            obs_dict[key] = torch.tensor(
+                np.array(obs_group[key][start:end]),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        # Load actions slice (if present)
+        act_dict = {}
+        if self.action_keys and "actions" in traj_group:
+            act_group = traj_group["actions"]
+            for key in self.action_keys:
+                act_dict[key] = torch.tensor(
+                    np.array(act_group[key][start:end]),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+
+        return {
+            **obs_dict,
+            **act_dict,
+            "dt": torch.tensor(
+                float(self.dt_list[idx]), dtype=torch.float32, device=self.device
+            ),
         }
-        act_batch = (
-            {
-                k: torch.stack([sample["actions"][k] for sample in batch])
-                for k in act_keys
-            }
-            if act_keys
-            else None
-        )
-        dt_batch = torch.stack([sample["dt"] for sample in batch])
-        return {"observations": obs_batch, "actions": act_batch, "dt": dt_batch}
 
     def validate_frequency_consistency(self) -> bool:
         """
@@ -206,8 +172,8 @@ class ZarrBackedTrajectoryDataset(BaseTrajectoryDataset):
         dt_values = []
         for idx in sample_indices:
             try:
-                dt_val = self.root["dt"][idx]
-                dt_values.append(float(np.asarray(dt_val)))
+                dt_val = float(self.dt_list[idx])
+                dt_values.append(dt_val)
             except Exception:
                 return False
 
@@ -216,21 +182,18 @@ class ZarrBackedTrajectoryDataset(BaseTrajectoryDataset):
             return all(abs(dt - dt_values[0]) < 1e-6 for dt in dt_values)
         return True
 
-    def get_frequency_info(self) -> dict:
+    def get_frequency_info(self) -> Dict[str, Any]:
         """
         Get frequency-related information from the dataset.
         """
-        info = {
-            "export_control_freq": self.export_control_freq,
-            "original_frequency": self.original_frequency,
-            "effective_frequency": self.effective_frequency,
+        info: Dict[str, Any] = {
             "consistent_dt": self.validate_frequency_consistency(),
         }
 
         # Add sample dt value
         if len(self) > 0:
             try:
-                sample_dt = float(np.asarray(self.root["dt"][0]))
+                sample_dt = float(self.dt_list[0])
                 info["sample_dt"] = sample_dt
                 info["sample_frequency"] = 1.0 / sample_dt if sample_dt > 0 else None
             except Exception:
@@ -238,10 +201,6 @@ class ZarrBackedTrajectoryDataset(BaseTrajectoryDataset):
                 info["sample_frequency"] = None
 
         return info
-
-    def shutdown(self):
-        self._stop_event.set()
-        self._prefetch_thread.join()
 
     def as_loader(self, **kwargs):
         raise NotImplementedError(
@@ -254,37 +213,53 @@ class ZarrBackedTrajectoryDataset(BaseTrajectoryDataset):
 
         return DatasetMeta(**self._metadata)
 
-    def get_window(self, traj_idx: int, start: int, length: int) -> dict:
+    def get_window(self, idx: int, start: int, length: int) -> Dict[str, Any]:
         """
         Efficiently fetch a window of [start:start+length] for a given trajectory index.
         Returns a dict with 'observations' and 'actions', each a dict of tensors.
         If the requested window exceeds the trajectory length, it is truncated.
         """
         # Find the actual length of this trajectory
-        traj_len = self.lengths[traj_idx]
+        traj_len = self.lengths[idx]
         end = min(start + length, traj_len)
-        obs = {
-            k: torch.from_numpy(self.root[f"observations/{k}"][traj_idx, start:end])
-            .float()
-            .to(self.device)
-            for k in self.observation_keys
-        }
-        actions = {
-            k: torch.from_numpy(self.root[f"actions/{k}"][traj_idx, start:end])
-            .float()
-            .to(self.device)
-            for k in self.action_keys
-        }
+
+        traj_group = self.root[f"traj_{idx:04d}"]
+
+        # Load observations slice
+        obs = {}
+        obs_group = traj_group["observations"]
+        for k in self.observation_keys:
+            obs[k] = (
+                torch.from_numpy(np.array(obs_group[k][start:end]))
+                .float()
+                .to(self.device)
+            )
+
+        # Load actions slice
+        actions = {}
+        if self.action_keys and "actions" in traj_group:
+            act_group = traj_group["actions"]
+            for k in self.action_keys:
+                actions[k] = (
+                    torch.from_numpy(np.array(act_group[k][start:end]))
+                    .float()
+                    .to(self.device)
+                )
+
         return {"observations": obs, "actions": actions}
 
     def batch_get(
-        self, traj_indices, step_indices, key: str, data_type: str = "observations"
+        self,
+        traj_indices: Union[torch.Tensor, np.ndarray, List[int]],
+        step_indices: Union[torch.Tensor, np.ndarray, List[int]],
+        key: str,
+        data_type: str = "observations",
     ) -> torch.Tensor:
         """
         Efficiently fetch a batch of (traj_idx, step_idx) pairs for a given key and data_type.
         Args:
-            traj_indices: 1D torch.Tensor or np.ndarray of trajectory indices [N]
-            step_indices: 1D torch.Tensor or np.ndarray of step indices [N]
+            traj_indices: 1D torch.Tensor, np.ndarray, or list of trajectory indices [N]
+            step_indices: 1D torch.Tensor, np.ndarray, or list of step indices [N]
             key: observation or action key
             data_type: 'observations' or 'actions'
         Returns:
@@ -294,25 +269,40 @@ class ZarrBackedTrajectoryDataset(BaseTrajectoryDataset):
             raise ValueError(
                 f"data_type must be 'observations' or 'actions', got {data_type}"
             )
-        arr = self.root.get(f"{data_type}/{key}")
-        if arr is None:
-            raise KeyError(f"Key '{key}' not found in {data_type}")
+
         # Convert indices to numpy
         if isinstance(traj_indices, torch.Tensor):
             traj_indices = traj_indices.cpu().numpy()
         if isinstance(step_indices, torch.Tensor):
             step_indices = step_indices.cpu().numpy()
-        # Advanced indexing workaround for Zarr: loop over pairs
+
+        # Collect data from per-trajectory format
         result = []
         for ti, si in zip(traj_indices, step_indices):
-            if ti < 0 or ti >= arr.shape[0]:
+            if ti < 0 or ti >= len(self):
                 raise IndexError(
-                    f"Trajectory index {ti} out of bounds for array with shape {arr.shape}"
+                    f"Trajectory index {ti} out of bounds for dataset with {len(self)} trajectories"
                 )
-            if si < 0 or si >= arr.shape[1]:
+
+            traj_group = self.root[f"traj_{ti:04d}"]
+            if data_type == "observations":
+                data_group = traj_group["observations"]
+            else:
+                if "actions" not in traj_group:
+                    raise KeyError(f"Actions not available for trajectory {ti}")
+                data_group = traj_group["actions"]
+
+            if key not in data_group:
+                raise KeyError(
+                    f"Key '{key}' not found in {data_type} for trajectory {ti}"
+                )
+
+            traj_data = data_group[key]
+            if si < 0 or si >= traj_data.shape[0]:
                 raise IndexError(
-                    f"Step index {si} out of bounds for array with shape {arr.shape}"
+                    f"Step index {si} out of bounds for trajectory {ti} with length {traj_data.shape[0]}"
                 )
-            result.append(arr[ti, si])
+            result.append(np.array(traj_data[si]))
+
         result = np.stack(result)
         return torch.from_numpy(result).to(self.device)

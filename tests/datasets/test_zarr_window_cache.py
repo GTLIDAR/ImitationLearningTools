@@ -70,9 +70,8 @@ def dummy_zarr_dataset():
                 end_step - 1 : end_step, :
             ]
 
-    # dt array should be 1D with one value per window
-    root.create_dataset("dt", shape=(total_windows,), dtype="f4")
-    root["dt"][:] = 0.05
+    # dt is now per-trajectory, not per-window, and is stored in metadata.json only
+    dt_value = 0.05
 
     # metadata for single trajectory
     meta = {
@@ -80,6 +79,7 @@ def dummy_zarr_dataset():
         "trajectory_lengths": [20],
         "observation_keys": ["qpos"],
         "action_keys": ["actions"],
+        "dt": [dt_value],
     }
     with open(meta_path, "w") as f:
         import json
@@ -123,9 +123,9 @@ def test_window_cache_basic(dummy_zarr_dataset):
             data_type="actions",
         )
         expected_act = dataset_window["actions"]["actions"][0]
-        assert torch.allclose(
-            act_val, expected_act
-        ), f"Action mismatch at step {step_idx}"
+        assert torch.allclose(act_val, expected_act), (
+            f"Action mismatch at step {step_idx}"
+        )
 
 
 def test_window_cache_boundary(dummy_zarr_dataset):
@@ -162,9 +162,9 @@ def test_window_cache_switch_env(dummy_zarr_dataset):
             )
             dataset_window = dummy_zarr_dataset[step_idx]
             expected = dataset_window["observations"]["qpos"][0]
-            assert torch.allclose(
-                val, expected
-            ), f"Mismatch at env {env_idx}, step {step_idx}"
+            assert torch.allclose(val, expected), (
+                f"Mismatch at env {env_idx}, step {step_idx}"
+            )
 
     # Test different step ranges for different environments
     # Env 0: steps 0-3, Env 1: steps 5-8
@@ -230,15 +230,15 @@ def test_window_cache_multiple_parallel_environments(dummy_zarr_dataset):
 
             # Verify correctness against dataset
             expected = dummy_zarr_dataset[step_idx]["observations"]["qpos"][0]
-            assert torch.allclose(
-                val, expected
-            ), f"Env {env_idx}, step {step_idx}: initial access mismatch"
+            assert torch.allclose(val, expected), (
+                f"Env {env_idx}, step {step_idx}: initial access mismatch"
+            )
 
     # Check cache statistics after initial access
     stats = cache.get_cache_stats()
-    assert (
-        stats["num_cached_environments"] == num_environments
-    ), f"Expected {num_environments} cached envs, got {stats['num_cached_environments']}"
+    assert stats["num_cached_environments"] == num_environments, (
+        f"Expected {num_environments} cached envs, got {stats['num_cached_environments']}"
+    )
     assert len(stats["cached_env_ids"]) == num_environments
     print(f"✅ All {num_environments} environments cached after initial access")
 
@@ -253,17 +253,17 @@ def test_window_cache_multiple_parallel_environments(dummy_zarr_dataset):
 
             # Should be identical to initial result (cache hit)
             expected_from_cache = initial_results[env_idx][i]
-            assert torch.allclose(
-                val, expected_from_cache
-            ), f"Env {env_idx}, step {step_idx}: cache hit mismatch"
+            assert torch.allclose(val, expected_from_cache), (
+                f"Env {env_idx}, step {step_idx}: cache hit mismatch"
+            )
 
             # Also verify against dataset
             expected_from_dataset = dummy_zarr_dataset[step_idx]["observations"][
                 "qpos"
             ][0]
-            assert torch.allclose(
-                val, expected_from_dataset
-            ), f"Env {env_idx}, step {step_idx}: dataset mismatch"
+            assert torch.allclose(val, expected_from_dataset), (
+                f"Env {env_idx}, step {step_idx}: dataset mismatch"
+            )
 
     print("✅ All cache hits returned correct data")
 
@@ -281,16 +281,16 @@ def test_window_cache_multiple_parallel_environments(dummy_zarr_dataset):
 
         # All should be identical (same step, same trajectory)
         expected = dummy_zarr_dataset[test_step]["observations"]["qpos"][0]
-        assert torch.allclose(
-            val, expected
-        ), f"Env {env_idx}: step {test_step} isolation test failed"
+        assert torch.allclose(val, expected), (
+            f"Env {env_idx}: step {test_step} isolation test failed"
+        )
 
     # Verify all environments got the same result for the same step
     reference_result = results_per_env[0]
     for env_idx, result in results_per_env.items():
-        assert torch.allclose(
-            result, reference_result
-        ), f"Env {env_idx}: result differs from reference"
+        assert torch.allclose(result, reference_result), (
+            f"Env {env_idx}: result differs from reference"
+        )
 
     print("✅ Environment isolation working correctly")
 
@@ -334,17 +334,17 @@ def test_window_cache_multiple_parallel_environments(dummy_zarr_dataset):
         expected_miss = dummy_zarr_dataset[outside_window_step]["observations"]["qpos"][
             0
         ]
-        assert torch.allclose(
-            val_miss, expected_miss
-        ), "Cache miss outside window failed"
+        assert torch.allclose(val_miss, expected_miss), (
+            "Cache miss outside window failed"
+        )
 
         # Verify cache was updated
         new_cached_traj_idx, new_cached_window_start, new_cached_data = cache.cache[
             test_env
         ]
-        assert (
-            new_cached_window_start != cached_window_start
-        ), "Cache window should have been updated"
+        assert new_cached_window_start != cached_window_start, (
+            "Cache window should have been updated"
+        )
         print(
             f"✅ Cache miss triggered new window: {cached_window_start} -> {new_cached_window_start}"
         )
@@ -381,12 +381,12 @@ def test_window_cache_multiple_parallel_environments(dummy_zarr_dataset):
     clear_env = 2
     cache.clear_cache(clear_env)
     stats_after_clear = cache.get_cache_stats()
-    assert (
-        clear_env not in stats_after_clear["cached_env_ids"]
-    ), f"Environment {clear_env} should be cleared from cache"
-    assert (
-        stats_after_clear["num_cached_environments"] == num_environments - 1
-    ), "Cache count should decrease by 1"
+    assert clear_env not in stats_after_clear["cached_env_ids"], (
+        f"Environment {clear_env} should be cleared from cache"
+    )
+    assert stats_after_clear["num_cached_environments"] == num_environments - 1, (
+        "Cache count should decrease by 1"
+    )
     print(f"✅ Selective cache clearing worked for environment {clear_env}")
 
     # Test accessing cleared environment (should work, just cache miss)
@@ -394,20 +394,20 @@ def test_window_cache_multiple_parallel_environments(dummy_zarr_dataset):
         clear_env, traj_idx, 1, key="qpos", data_type="observations"
     )
     expected_after_clear = dummy_zarr_dataset[1]["observations"]["qpos"][0]
-    assert torch.allclose(
-        val_after_clear, expected_after_clear
-    ), "Access after cache clear failed"
+    assert torch.allclose(val_after_clear, expected_after_clear), (
+        "Access after cache clear failed"
+    )
     print("✅ Access after cache clear works correctly")
 
     # Test clearing all caches
     cache.clear_cache()  # Clear all
     stats_after_clear_all = cache.get_cache_stats()
-    assert (
-        stats_after_clear_all["num_cached_environments"] == 0
-    ), "All caches should be cleared"
-    assert (
-        len(stats_after_clear_all["cached_env_ids"]) == 0
-    ), "No environments should be cached"
+    assert stats_after_clear_all["num_cached_environments"] == 0, (
+        "All caches should be cleared"
+    )
+    assert len(stats_after_clear_all["cached_env_ids"]) == 0, (
+        "No environments should be cached"
+    )
     print("✅ Clear all caches works correctly")
 
     # === TEST 7: Memory efficiency ===
@@ -602,9 +602,9 @@ def test_zarr_window_cache_with_unitree_squatting(tmp_path, visualize_enabled):
             ]  # First step of window
 
             # They should match
-            assert torch.allclose(
-                cached_qpos, direct_qpos, atol=1e-6
-            ), f"Cache mismatch at env {env_idx}, step {step_idx}"
+            assert torch.allclose(cached_qpos, direct_qpos, atol=1e-6), (
+                f"Cache mismatch at env {env_idx}, step {step_idx}"
+            )
 
             # Also test qvel if available
             if "qvel" in dataset.root["observations"]:
@@ -616,9 +616,9 @@ def test_zarr_window_cache_with_unitree_squatting(tmp_path, visualize_enabled):
                     data_type="observations",
                 )
                 direct_qvel = direct_sample["observations"]["qvel"][0]
-                assert torch.allclose(
-                    cached_qvel, direct_qvel, atol=1e-6
-                ), f"Cache qvel mismatch at env {env_idx}, step {step_idx}"
+                assert torch.allclose(cached_qvel, direct_qvel, atol=1e-6), (
+                    f"Cache qvel mismatch at env {env_idx}, step {step_idx}"
+                )
 
     print("✅ ZarrTrajectoryWindowCache tests passed!")
 

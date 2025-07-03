@@ -38,6 +38,7 @@ def minimal_loader(monkeypatch):
             action_keys=["actions"],
             trajectory_lengths=[10, 10],
             num_trajectories=2,
+            dt=[0.05, 0.05],
         )
 
         def __len__(self):
@@ -115,6 +116,7 @@ def test_parallel_export_large(tmp_path, minimal_loader):
             trajectory_lengths=[10] * 20,
             num_trajectories=20,
             version="0.0.1",
+            dt=[0.05] * 20,
         )
 
         def __len__(self):
@@ -187,6 +189,7 @@ def test_loco_loader_len_and_getitem():
             action_keys=["actions"],
             trajectory_lengths=[8, 8, 8],
             num_trajectories=3,
+            dt=[0.033, 0.033, 0.033],
         )
 
         def __len__(self):
@@ -228,6 +231,7 @@ def test_loco_as_dataset():
             action_keys=["actions"],
             trajectory_lengths=[8, 8, 8],
             num_trajectories=3,
+            dt=[0.033, 0.033, 0.033],
         )
 
         def __len__(self):
@@ -472,6 +476,7 @@ def test_loader_to_dataset_conversion_simple(tmp_path, visualize_enabled):
                 action_keys=base_loader.metadata.action_keys,
                 trajectory_lengths=[max_length],  # Truncated length!
                 num_trajectories=1,
+                dt=base_loader.metadata.dt,
             )
 
         @property
@@ -556,9 +561,9 @@ def test_loader_to_dataset_conversion_simple(tmp_path, visualize_enabled):
         )
 
         # Basic validation - just check that data exists and has right window size
-        assert (
-            sample["observations"]["qpos"].shape[0] == window_size
-        ), f"Expected window size {window_size}, got {sample['observations']['qpos'].shape[0]}"
+        assert sample["observations"]["qpos"].shape[0] == window_size, (
+            f"Expected window size {window_size}, got {sample['observations']['qpos'].shape[0]}"
+        )
 
         # === VISUAL INSPECTION ===
         print("\n=== VISUAL INSPECTION ===")

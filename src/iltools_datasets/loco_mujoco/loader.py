@@ -37,9 +37,9 @@ class LocoMuJoCoLoader(BaseTrajectoryLoader):
         self.default_control_freq = default_control_freq
         self._setup_cache()
         self.env = self._load_env()
-        assert hasattr(self.env, "th") and isinstance(
-            self.env.th, TrajectoryHandler
-        ), "TrajectoryHandler not found in env"
+        assert hasattr(self.env, "th") and isinstance(self.env.th, TrajectoryHandler), (
+            "TrajectoryHandler not found in env"
+        )
         self.th: TrajectoryHandler = self.env.th
 
         # Store original frequency info
@@ -131,6 +131,9 @@ class LocoMuJoCoLoader(BaseTrajectoryLoader):
             else:
                 trajectory_lengths.append(int(self.th.len_trajectory(traj_ind)))
 
+        # dt is 1.0 / effective_frequency for all trajectories
+        dt = [1.0 / self.effective_freq] * self.th.n_trajectories
+
         return DatasetMeta(
             name=f"loco_mujoco_{self.env_name}_{self.task}",
             source="loco_mujoco",
@@ -140,9 +143,7 @@ class LocoMuJoCoLoader(BaseTrajectoryLoader):
             observation_keys=obs_keys,
             action_keys=action_keys,
             trajectory_lengths=trajectory_lengths,
-            # Add frequency metadata
-            original_frequency=self.original_freq,
-            effective_frequency=self.effective_freq,
+            dt=dt,
         )
 
     @property

@@ -11,3 +11,6 @@ class DatasetMeta(BaseModel, frozen=True):
     observation_keys: List[str]
     action_keys: Optional[List[str]] = None
     trajectory_lengths: Union[int, List[int]]
+    dt: Union[float, List[float]] = Field(
+        ..., description="Time step(s) per trajectory (seconds)"
+    )
