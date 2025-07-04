@@ -4,6 +4,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 import torch
+import zarr
 from loco_mujoco.task_factories import (
     AMASSDatasetConf,
     DefaultDatasetConf,
@@ -16,12 +17,12 @@ from loco_mujoco.trajectory.handler import TrajectoryHandler
 from iltools_core.metadata_schema import DatasetMeta
 from iltools_core.trajectory import Trajectory as ILTTrajectory
 from iltools_datasets.base_loader import (
-    BaseTrajectoryDataset,
-    BaseTrajectoryLoader,
+    BaseDataset,
+    BaseLoader,
 )
 
 
-class LocoMuJoCoLoader(BaseTrajectoryLoader):
+class LocoMuJoCoLoader(BaseLoader):
     """
     Flexible loader for Loco-MuJoCo trajectories.
     """
@@ -161,6 +162,7 @@ class LocoMuJoCoLoader(BaseTrajectoryLoader):
         Optionally interpolates to the desired control frequency.
         If control_freq is None, uses the loader's default_control_freq or original frequency.
         """
+        raise NotImplementedError("Not implemented")
         # Determine effective control frequency
         effective_control_freq = control_freq or self.effective_freq
 
@@ -284,62 +286,12 @@ class LocoMuJoCoLoader(BaseTrajectoryLoader):
             "mask": mask,
         }
 
-    def as_dataset(self, **kwargs) -> BaseTrajectoryDataset:
-        return LocoMuJoCoTrajectoryIndexDataset(self, **kwargs)
+    def as_dataset(self, **kwargs) -> BaseDataset:
+        return LazyDataset(self, **kwargs)
 
-
-class LocoMuJoCoTrajectoryIndexDataset(BaseTrajectoryDataset):
-    """
-    PyTorch Dataset that provides trajectory indices and metadata for sampling.
-    """
-
-    def __init__(self, loader: LocoMuJoCoLoader):
-        self.loader = loader
-        lengths = loader.metadata.trajectory_lengths
-        if isinstance(lengths, int):
-            # If a single int, repeat for all trajectories
-            self.lengths = [lengths] * loader.metadata.num_trajectories
-        else:
-            self.lengths = list(lengths)
-
-    def __len__(self):
-        return len(self.lengths)
-
-    def __getitem__(self, idx):
-        return {
-            "traj_idx": idx,
-            "length": self.lengths[idx],
-            # Add more metadata if needed
-        }
-
-    @property
-    def metadata(self):
-        return self.loader.metadata
-
-    def as_loader(self, **kwargs):
-        return self.loader
-
-
-class LocoMuJoCoTrajectoryAccessor:
-    """
-    Provides fast, cached access to trajectories as torch tensors.
-    """
-
-    def __init__(self, loader: LocoMuJoCoLoader, cache_size: int = 128):
-        self.loader = loader
-        self._get_traj = lru_cache(maxsize=cache_size)(self._get_traj_uncached)
-
-    def _get_traj_uncached(self, idx):
-        traj = self.loader[idx]
-        obs = {k: torch.from_numpy(v).float() for k, v in traj.observations.items()}
-        actions = {
-            k: torch.from_numpy(v).float() for k, v in (traj.actions or {}).items()
-        }
-        return {
-            "observations": obs,
-            "actions": actions,
-            "dt": torch.tensor(traj.dt, dtype=torch.float32),
-        }
-
-    def get(self, idx):
-        return self._get_traj(idx)
+    def save(self, path: str, **kwargs) -> None:
+        """
+        Saves the dataset to a directory.
+        """
+        chunk_size: int = kwargs.get("chunk_size", 1000)
+        root = zarr.open(path, mode="w")

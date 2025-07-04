@@ -5,13 +5,13 @@ import numpy as np
 import zarr
 from typing import Optional
 from iltools_core.metadata_schema import DatasetMeta
-from iltools_datasets.base_loader import BaseTrajectoryLoader
+from iltools_datasets.base_loader import BaseLoader
 from tqdm import tqdm
 
 logger = logging.getLogger("iltools_datasets.export_utils")
 
 
-def export_trajectories_to_disk(loader: BaseTrajectoryLoader, out_dir: str):
+def export_trajectories_to_disk(loader: BaseLoader, out_dir: str):
     os.makedirs(out_dir, exist_ok=True)
     if not isinstance(loader.metadata, DatasetMeta):
         raise TypeError("Loader metadata must be an instance of DatasetMeta")
@@ -39,7 +39,7 @@ def export_trajectories_to_disk(loader: BaseTrajectoryLoader, out_dir: str):
 
 
 def export_trajectories_to_zarr_per_trajectory(
-    loader: BaseTrajectoryLoader,
+    loader: BaseLoader,
     out_dir: str,
     chunk_size: int = 1000,
 ):
@@ -141,7 +141,7 @@ def export_trajectories_to_zarr_per_trajectory(
 
 
 def export_trajectories_to_zarr(
-    loader: BaseTrajectoryLoader,
+    loader: BaseLoader,
     out_dir: str,
     num_workers: int = 8,
     window_size: Optional[int] = None,

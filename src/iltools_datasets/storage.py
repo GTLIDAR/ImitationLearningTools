@@ -3,7 +3,7 @@ import json
 import queue
 import threading
 from functools import lru_cache
-from typing import Dict, Any, Union, List
+from typing import Dict, Any, Optional, Union, List
 
 import numpy as np
 import torch
@@ -11,61 +11,7 @@ import zarr
 from iltools_datasets.base_loader import BaseTrajectoryDataset
 
 
-class DiskBackedTrajectoryDataset(BaseTrajectoryDataset):
-    def __init__(self, data_dir, cache_size=128, device="cpu"):
-        self.data_dir = data_dir
-        with open(os.path.join(data_dir, "metadata.json"), "r") as f:
-            self._metadata = json.load(f)
-        self.lengths = self._metadata["trajectory_lengths"]
-        if isinstance(self.lengths, int):
-            self.lengths = [self.lengths] * self._metadata["num_trajectories"]
-        self.observation_keys = self._metadata["observation_keys"]
-        self.action_keys = self._metadata["action_keys"] or []
-        self.device = device
-        self.dt_list = self._metadata["dt"]
-        self._get_traj = lru_cache(maxsize=cache_size)(self._get_traj_uncached)
-
-    def __len__(self):
-        return len(self.lengths)
-
-    def __getitem__(self, idx):
-        d = self._get_traj(idx)
-        d["observations"] = {k: v.to(self.device) for k, v in d["observations"].items()}
-        d["actions"] = {k: v.to(self.device) for k, v in d["actions"].items()}
-        # d["dt"] = d["dt"].to(self.device)
-        return d
-
-    def _get_traj_uncached(self, idx):
-        path = os.path.join(self.data_dir, f"traj_{idx}.npz")
-        data = np.load(path)
-        obs = {
-            k: torch.from_numpy(data[k]).float()
-            for k in self.observation_keys
-            if k in data
-        }
-        actions = {
-            k: torch.from_numpy(data[k]).float() for k in self.action_keys if k in data
-        }
-        dt = float(self.dt_list[idx])
-        return {
-            "observations": obs,
-            "actions": actions,
-            "dt": torch.tensor(dt, dtype=torch.float32),
-        }
-
-    @property
-    def metadata(self):
-        from iltools_core.metadata_schema import DatasetMeta
-
-        return DatasetMeta(**self._metadata)
-
-    def as_loader(self, **kwargs):
-        raise NotImplementedError(
-            "DiskBackedTrajectoryDataset cannot be converted to a loader directly."
-        )
-
-
-class ZarrBackedTrajectoryDataset(BaseTrajectoryDataset):
+class LazyTrajectoryDataset(BaseTrajectoryDataset):
     """Dataset that reads from per-trajectory Zarr format.
 
     Each trajectory is stored as a separate Zarr group:
@@ -81,8 +27,6 @@ class ZarrBackedTrajectoryDataset(BaseTrajectoryDataset):
             self._metadata = json.load(f)
 
         self.lengths = self._metadata["trajectory_lengths"]
-        if isinstance(self.lengths, int):
-            self.lengths = [self.lengths] * self._metadata["num_trajectories"]
 
         self.observation_keys = self._metadata["observation_keys"]
         self.action_keys = self._metadata["action_keys"] or []
@@ -97,35 +41,13 @@ class ZarrBackedTrajectoryDataset(BaseTrajectoryDataset):
         return len(self.lengths)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        traj_group = self.root[f"traj_{idx:04d}"]
-
-        # Load observations
-        obs_dict = {}
-        obs_group = traj_group["observations"]
-        for key in self.observation_keys:
-            obs_dict[key] = torch.tensor(
-                np.array(obs_group[key]), dtype=torch.float32, device=self.device
-            )
-
-        # Load actions (if present)
-        act_dict = {}
-        if self.action_keys and "actions" in traj_group:
-            act_group = traj_group["actions"]
-            for key in self.action_keys:
-                act_dict[key] = torch.tensor(
-                    np.array(act_group[key]), dtype=torch.float32, device=self.device
-                )
-
-        return {
-            **obs_dict,
-            **act_dict,
-            "dt": torch.tensor(
-                float(self.dt_list[idx]), dtype=torch.float32, device=self.device
-            ),
-        }
+        """
+        returns a trajectory
+        """
+        return self.get_trajectory_slice(idx)
 
     def get_trajectory_slice(
-        self, idx: int, start: int = None, end: int = None
+        self, idx: int, start: Optional[int] = 0, end: Optional[int] = -1
     ) -> Dict[str, Any]:
         """Get a slice of a trajectory without loading the entire trajectory."""
         traj_group = self.root[f"traj_{idx:04d}"]
