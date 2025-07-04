@@ -25,19 +25,20 @@ from iltools_datasets.base_loader import (
 class LocoMuJoCoLoader(BaseLoader):
     """
     Flexible loader for Loco-MuJoCo trajectories.
+    Now supports multiple datasets/motions (default, lafan1, amass).
     """
 
     def __init__(
         self,
         env_name: str,
-        task: str = "walk",
+        dataset_motion_config: dict = None,  # e.g. {"default": ["walk", "squat"], "lafan1": ["dance2_subject4"], "amass": ["DanceDB/..."]}
         default_control_freq: Optional[float] = None,
     ):
         self.env_name = env_name
-        self.task = task
+        self.dataset_motion_config = dataset_motion_config or {"default": ["walk"]}
         self.default_control_freq = default_control_freq
         self._setup_cache()
-        self.env = self._load_env()
+        self.env, self._traj_to_motion = self._load_env_and_mapping()
         assert hasattr(self.env, "th") and isinstance(self.env.th, TrajectoryHandler), (
             "TrajectoryHandler not found in env"
         )
@@ -55,19 +56,33 @@ class LocoMuJoCoLoader(BaseLoader):
             os.makedirs(cache_path)
         os.environ["LOCO_MUJOCO_CACHE"] = cache_path
 
-    def _load_env(self):
-        try:
-            return ImitationFactory.make(
-                self.env_name,
-                default_dataset_conf=DefaultDatasetConf([self.task]),
-                n_substeps=20,
-            )
-        except Exception as e:
-            if "MyoSkeleton" in self.env_name:
-                print(
-                    "Error loading MyoSkeleton environment. Did you run 'loco-mujoco-myomodel-init'?"
-                )
-            raise e
+    def _load_env_and_mapping(self):
+        # Build config objects for each dataset type
+        from loco_mujoco.task_factories import DefaultDatasetConf, LAFAN1DatasetConf, AMASSDatasetConf, ImitationFactory
+        default_conf = DefaultDatasetConf(self.dataset_motion_config.get("default", [])) if "default" in self.dataset_motion_config else None
+        lafan1_conf = LAFAN1DatasetConf(self.dataset_motion_config.get("lafan1", [])) if "lafan1" in self.dataset_motion_config else None
+        amass_conf = AMASSDatasetConf(self.dataset_motion_config.get("amass", [])) if "amass" in self.dataset_motion_config else None
+        # Call ImitationFactory.make with all configs
+        env = ImitationFactory.make(
+            self.env_name,
+            default_dataset_conf=default_conf,
+            lafan1_dataset_conf=lafan1_conf,
+            amass_dataset_conf=amass_conf,
+            n_substeps=20,
+        )
+        # Try to build a mapping from trajectory index to (dataset_type, motion)
+        # This depends on env.th.traj.info having motion_names and dataset_types attributes
+        info = getattr(env.th.traj, "info", None)
+        if info is not None:
+            motion_names = getattr(info, "motion_names", None)
+            dataset_types = getattr(info, "dataset_types", None)
+            if motion_names is not None and dataset_types is not None:
+                mapping = [(dataset_types[i], motion_names[i]) for i in range(len(motion_names))]
+            else:
+                mapping = [("unknown", "unknown") for _ in range(env.th.n_trajectories)]
+        else:
+            mapping = [("unknown", "unknown") for _ in range(env.th.n_trajectories)]
+        return env, mapping
 
     def _discover_metadata(self) -> DatasetMeta:
         # Discover available observation/action keys from the first trajectory
@@ -136,7 +151,7 @@ class LocoMuJoCoLoader(BaseLoader):
         dt = [1.0 / self.effective_freq] * self.th.n_trajectories
 
         return DatasetMeta(
-            name=f"loco_mujoco_{self.env_name}_{self.task}",
+            name=f"loco_mujoco_{self.env_name}_{self.dataset_motion_config['default'][0]}",
             source="loco_mujoco",
             version="1.0.1",
             citation="TODO",
@@ -291,7 +306,54 @@ class LocoMuJoCoLoader(BaseLoader):
 
     def save(self, path: str, **kwargs) -> None:
         """
-        Saves the dataset to a directory.
+        Saves the dataset to a directory. The dataset format is a Zarr store.
+        The structure is as follows:
+        Dataset/
+        ├── motion1/  # e.g., default_walk
+        │   ├── trajectory1/
+        │   │   ├── observations/
+        │   │   ├── actions/
+        │   │   ├── rewards
+        │   │   └── infos
+        │   ├── trajectory2/
+        │   └── ...
+        └── ...
         """
+        import zarr
+        import numpy as np
+        import os
         chunk_size: int = kwargs.get("chunk_size", 1000)
-        root = zarr.open(path, mode="w")
+        if not os.path.exists(path):
+            os.makedirs(path)
+        store = zarr.DirectoryStore(os.path.join(path, "trajectories.zarr"))
+        root = zarr.group(store=store, overwrite=True)
+        # Group trajectories by motion name (with dataset type prefix)
+        from collections import defaultdict
+        groupings = defaultdict(list)
+        for idx, (dataset_type, motion) in enumerate(self._traj_to_motion):
+            motion_name = f"{dataset_type}_{motion}"
+            groupings[motion_name].append(idx)
+        for motion_name, indices in groupings.items():
+            motion_group = root.require_group(motion_name)
+            for i, idx in enumerate(indices):
+                traj = self.__getitem__(idx)
+                traj_group = motion_group.require_group(f"trajectory{i}")
+                # Save observations
+                obs_group = traj_group.require_group("observations")
+                for k, v in traj.observations.items():
+                    obs_group.create_dataset(k, data=v, chunks=(min(chunk_size, v.shape[0]),) + v.shape[1:], overwrite=True)
+                # Save actions
+                if traj.actions is not None:
+                    act_group = traj_group.require_group("actions")
+                    for k, v in traj.actions.items():
+                        act_group.create_dataset(k, data=v, chunks=(min(chunk_size, v.shape[0]),) + v.shape[1:], overwrite=True)
+                # Save rewards if present
+                if hasattr(traj, "rewards") and traj.rewards is not None:
+                    traj_group.create_dataset("rewards", data=traj.rewards, chunks=(min(chunk_size, traj.rewards.shape[0]),), overwrite=True)
+                # Save infos if present
+                if hasattr(traj, "infos") and traj.infos is not None:
+                    import json
+                    try:
+                        traj_group.attrs["infos"] = json.dumps(traj.infos)
+                    except Exception:
+                        traj_group.attrs["infos"] = str(traj.infos)

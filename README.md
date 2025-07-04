@@ -7,28 +7,41 @@ This is **only a skeleton**—fill in each module with real logic as you develop
 
 The structure of a dataset is as follows:
 
-```
+```text
 Dataset/
-├── Motion1/
-│   ├── Trajectory1/
-│   │   ├── observations.npy
-│   │   ├── qpos.npy
-│   │   └── qvel.npy
-│   ├── actions.npy
-│   ├── rewards.npy
-│   └── infos.pkl
-│   └── Trajectory2/
-│       ├── observations.npy
-│       ├── qpos.npy
-│       └── qvel.npy
-├── Motion2/
-│   └── Trajectory1/
-│       ├── observations.npy
-│       ├── qpos.npy
-│       └── qvel.npy
-└── Motion3/
-    └── Trajectory1/
-        ├── observations.npy
-        ├── qpos.npy
-        └── qvel.npy
+├── motion1/
+│   ├── trajectory1/
+│   │   ├── observations/
+│   │   │   ├── qpos
+│   │   │   ├── qvel
+│   │   │   └── ...
+│   │   ├── actions/
+│   │   │   ├── target_joint_pos
+│   │   │   └── ...
+│   │   ├── rewards
+│   │   └── infos
+│   ├── trajectory2/
+│   │   ├── observations/
+│   │   │   ├── qpos
+│   │   │   ├── qvel
+│   │   │   └── ...
+│   │   ├── actions/
+│   │   │   ├── target_joint_pos
+│   │   │   └── ...
+│   │   ├── rewards
+│   │   └── infos
+│   └── ...
+├── motion2/
+│   ├── trajectory1/
+│   │   ├── observations/
+│   │   │   ├── qpos
+│   │   │   ├── qvel
+│   │   │   └── ...
+│   │   ├── actions/
+│   │   │   ├── target_joint_pos
+│   │   │   └── ...
+│   │   ├── rewards
+│   │   └── infos
+│   └── ...
+└── ...
 ```
