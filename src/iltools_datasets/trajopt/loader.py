@@ -4,10 +4,10 @@ from typing import List, Dict, Any
 from iltools_core.trajectory import Trajectory
 from iltools_core.metadata_schema import DatasetMeta
 from torch.utils.data import Dataset as TorchDataset
-from iltools_datasets.base_loader import BaseTrajectoryLoader, BaseTrajectoryDataset
+from iltools_datasets.base_loader import BaseLoader
 
 
-class TrajoptLoader(BaseTrajectoryLoader):
+class TrajoptLoader(BaseLoader):
     """
     Loads trajectories from a directory of trajectory optimization results.
     """
@@ -62,7 +62,7 @@ class TrajoptLoader(BaseTrajectoryLoader):
 
 
 # PyTorch Dataset for TrajoptLoader
-class TrajoptTrajectoryDataset(BaseTrajectoryDataset):
+class TrajoptTrajectoryDataset(BaseDataset):
     def __init__(self, loader: TrajoptLoader, device="cpu"):
         self.loader = loader
         self.device = device

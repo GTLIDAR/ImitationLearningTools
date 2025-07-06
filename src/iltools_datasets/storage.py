@@ -1,230 +1,162 @@
-import os
-import json
-import queue
-import threading
-from functools import lru_cache
-from typing import Dict, Any, Optional, Union, List
+from typing import Optional
 
 import numpy as np
-import torch
 import zarr
-from iltools_datasets.base_loader import BaseTrajectoryDataset
+from omegaconf import DictConfig
+from iltools_datasets.base_loader import BaseDataset
+from dask.distributed import Client
+import dask.array as da
+from dask.distributed import wait
 
 
-class LazyTrajectoryDataset(BaseTrajectoryDataset):
+class VectorizedTrajectoryDataset(BaseDataset):
     """Dataset that reads from per-trajectory Zarr format.
 
     Each trajectory is stored as a separate Zarr group:
-    trajectories.zarr/traj_XXXX/observations/{key}, actions/{key}
+
     """
 
-    def __init__(self, data_dir: str, device: str = "cpu"):
-        self.data_dir = data_dir
-        self.device = device
+    def __init__(self, zarr_path: str, num_envs: int, cfg: DictConfig, **kwargs):
+        self.dask_client = Client()
+        self.zarr_dataset = zarr.open_group(zarr_path, mode="r")
+        print(self.zarr_dataset.tree())
+        print(sorted(self.zarr_dataset["loco_mujoco"].attrs))
+        self.num_envs = num_envs
+        self.cfg = cfg
+        self.window_size = cfg.window_size
+        self.all_keys = []
 
-        # Load global metadata
-        with open(os.path.join(data_dir, "metadata.json"), "r") as f:
-            self._metadata = json.load(f)
+        # suppose we have num_envs trajectories which are specified by cfg
+        self.shuttle = self.prepare_shuttle(num_envs)
 
-        self.lengths = self._metadata["trajectory_lengths"]
+        # TODO: add customization
+        self.shuttle_pt = [0] * num_envs
 
-        self.observation_keys = self._metadata["observation_keys"]
-        self.action_keys = self._metadata["action_keys"] or []
-        self.dt_list = self._metadata["dt"]
-
-        # Open Zarr store
-        zarr_path = os.path.join(data_dir, "trajectories.zarr")
-        store = zarr.DirectoryStore(zarr_path)
-        self.root = zarr.open_group(store=store, mode="r")
-
-    def __len__(self) -> int:
-        return len(self.lengths)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """
-        returns a trajectory
-        """
-        return self.get_trajectory_slice(idx)
-
-    def get_trajectory_slice(
-        self, idx: int, start: Optional[int] = 0, end: Optional[int] = -1
-    ) -> Dict[str, Any]:
-        """Get a slice of a trajectory without loading the entire trajectory."""
-        traj_group = self.root[f"traj_{idx:04d}"]
-
-        # Load observations slice
-        obs_dict = {}
-        obs_group = traj_group["observations"]
-        for key in self.observation_keys:
-            obs_dict[key] = torch.tensor(
-                np.array(obs_group[key][start:end]),
-                dtype=torch.float32,
-                device=self.device,
-            )
-
-        # Load actions slice (if present)
-        act_dict = {}
-        if self.action_keys and "actions" in traj_group:
-            act_group = traj_group["actions"]
-            for key in self.action_keys:
-                act_dict[key] = torch.tensor(
-                    np.array(act_group[key][start:end]),
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-
-        return {
-            **obs_dict,
-            **act_dict,
-            "dt": torch.tensor(
-                float(self.dt_list[idx]), dtype=torch.float32, device=self.device
-            ),
-        }
-
-    def validate_frequency_consistency(self) -> bool:
-        """
-        Validate that all samples have consistent dt values.
-        Returns True if consistent, False otherwise.
-        """
-        if len(self) == 0:
-            return True
-
-        # Sample a few dt values to check consistency
-        sample_indices = [0, min(len(self) - 1, 10), len(self) - 1]
-        dt_values = []
-        for idx in sample_indices:
-            try:
-                dt_val = float(self.dt_list[idx])
-                dt_values.append(dt_val)
-            except Exception:
-                return False
-
-        # Check if all dt values are approximately equal
-        if len(dt_values) > 1:
-            return all(abs(dt - dt_values[0]) < 1e-6 for dt in dt_values)
-        return True
-
-    def get_frequency_info(self) -> Dict[str, Any]:
-        """
-        Get frequency-related information from the dataset.
-        """
-        info: Dict[str, Any] = {
-            "consistent_dt": self.validate_frequency_consistency(),
-        }
-
-        # Add sample dt value
-        if len(self) > 0:
-            try:
-                sample_dt = float(self.dt_list[0])
-                info["sample_dt"] = sample_dt
-                info["sample_frequency"] = 1.0 / sample_dt if sample_dt > 0 else None
-            except Exception:
-                info["sample_dt"] = None
-                info["sample_frequency"] = None
-
-        return info
-
-    def as_loader(self, **kwargs):
-        raise NotImplementedError(
-            "ZarrBackedTrajectoryDataset cannot be converted to a loader directly."
-        )
+        self.env_plan = self._build_env_plan()
 
     @property
-    def metadata(self):
-        from iltools_core.metadata_schema import DatasetMeta
+    def available_dataset_sources(self) -> list[str]:
+        return list(self.zarr_dataset.keys())
 
-        return DatasetMeta(**self._metadata)
+    @property
+    def available_motions(self) -> list[str]:
+        return [
+            motion
+            for dataset_source in self.available_dataset_sources
+            for motion in self.available_motions_in(dataset_source)
+        ]
 
-    def get_window(self, idx: int, start: int, length: int) -> Dict[str, Any]:
+    def available_motions_in(self, dataset_source: str) -> list[str]:
+        dataset_source_group = self.zarr_dataset[dataset_source]
+        assert isinstance(dataset_source_group, zarr.Group)
+        return list(dataset_source_group.keys())
+
+    def available_trajectories_in(self, dataset_source: str, motion: str) -> list[str]:
+        dataset_source_group = self.zarr_dataset[dataset_source]
+        assert isinstance(dataset_source_group, zarr.Group)
+        motion_group = dataset_source_group[motion]
+        assert isinstance(motion_group, zarr.Group)
+        return list(motion_group.keys())
+
+    @property
+    def available_trajectories(self) -> list[str]:
+        return [
+            f"{dataset_source}/{motion}/{trajectory}"
+            for dataset_source in self.available_dataset_sources
+            for motion in self.available_motions_in(dataset_source)
+            for trajectory in self.available_trajectories_in(dataset_source, motion)
+        ]
+
+    def prepare_shuttle(self, num_envs: int) -> dict[str, list[da.Array]]:
+        """Prepare shuttle for fetching trajectories.
+
+        Returns a dictionary of lists of trajectories, where the keys are the dataset sources
+        and the values are the trajectories.
         """
-        Efficiently fetch a window of [start:start+length] for a given trajectory index.
-        Returns a dict with 'observations' and 'actions', each a dict of tensors.
-        If the requested window exceeds the trajectory length, it is truncated.
-        """
-        # Find the actual length of this trajectory
-        traj_len = self.lengths[idx]
-        end = min(start + length, traj_len)
+        shuttle: dict[str, list[da.Array]] = {}
 
-        traj_group = self.root[f"traj_{idx:04d}"]
+        typical_trajectory = self.zarr_dataset[self.available_trajectories[0]]
+        assert isinstance(typical_trajectory, zarr.Group)
+        self.all_keys = sorted(typical_trajectory.keys())
+        for key in typical_trajectory.keys():
+            shuttle[key] = []
 
-        # Load observations slice
-        obs = {}
-        obs_group = traj_group["observations"]
-        for k in self.observation_keys:
-            obs[k] = (
-                torch.from_numpy(np.array(obs_group[k][start:end]))
-                .float()
-                .to(self.device)
-            )
+            # initialize with the first trajectory
+            for _ in range(num_envs):
+                data_path = self.available_trajectories[0] + "/" + key
+                shuttle[key].append(da.from_zarr(self.zarr_dataset[data_path]))
 
-        # Load actions slice
-        actions = {}
-        if self.action_keys and "actions" in traj_group:
-            act_group = traj_group["actions"]
-            for k in self.action_keys:
-                actions[k] = (
-                    torch.from_numpy(np.array(act_group[k][start:end]))
-                    .float()
-                    .to(self.device)
+        return shuttle
+
+    def prepare_shuttle_pt(self, num_envs: int) -> list[int]:
+        """Prepare shuttle pointer for fetching trajectories."""
+        return [0] * num_envs
+
+    def update_shuttle_pt(self, env_to_traj: dict[int, int]):
+        """Update shuttle pointer for fetching trajectories."""
+        for env_id, idx in env_to_traj.items():
+            self.shuttle_pt[env_id] = idx
+
+    def update_shuttle(self, env_to_traj: dict[int, int]):
+        """Update shuttle for fetching trajectories."""
+        for key in self.shuttle.keys():
+            for env_id, traj_id in env_to_traj.items():
+                self.shuttle[key][env_id] = da.from_zarr(
+                    self.zarr_dataset[self.available_trajectories[traj_id]]
                 )
 
-        return {"observations": obs, "actions": actions}
+    def _build_env_plan(self):
+        """Build slice for fetching trajectories. For example,
+        env_plan = [
+            (0, 10),  # env-0  ←  traj_0[10]
+            (1, 10),  # env-1  ←  traj_1[35 000]
+            (2, 10),  # env-2  ←  traj_2[1 234]
+            (3, 10),
+        ]  # env-3  ←  traj_3[42]
+        """
+        return [(env_id, self.shuttle_pt[env_id]) for env_id in range(self.num_envs)]
 
-    def batch_get(
+    def _update_env_plan(self, env_to_step: dict[int, int]):
+        """Update env plan for fetching trajectories."""
+        for env_id, step in env_to_step.items():
+            self.env_plan[env_id] = (self.env_plan[env_id][0], step)
+
+    def update_references(
         self,
-        traj_indices: Union[torch.Tensor, np.ndarray, List[int]],
-        step_indices: Union[torch.Tensor, np.ndarray, List[int]],
-        key: str,
-        data_type: str = "observations",
-    ) -> torch.Tensor:
-        """
-        Efficiently fetch a batch of (traj_idx, step_idx) pairs for a given key and data_type.
-        Args:
-            traj_indices: 1D torch.Tensor, np.ndarray, or list of trajectory indices [N]
-            step_indices: 1D torch.Tensor, np.ndarray, or list of step indices [N]
-            key: observation or action key
-            data_type: 'observations' or 'actions'
-        Returns:
-            torch.Tensor of shape [N, ...] on the correct device
-        """
-        if data_type not in ["observations", "actions"]:
-            raise ValueError(
-                f"data_type must be 'observations' or 'actions', got {data_type}"
-            )
+        env_to_traj: Optional[dict[int, int]] = None,
+        env_to_step: Optional[dict[int, int]] = None,
+    ):
+        if env_to_traj is not None:
+            self.update_shuttle(env_to_traj)
+        if env_to_step is not None:
+            self.update_shuttle_pt(env_to_step)
+            self._update_env_plan(env_to_step)
 
-        # Convert indices to numpy
-        if isinstance(traj_indices, torch.Tensor):
-            traj_indices = traj_indices.cpu().numpy()
-        if isinstance(step_indices, torch.Tensor):
-            step_indices = step_indices.cpu().numpy()
+    def _maybe_prefetch(self, key: str):
+        """Prefetch data if the number of environments is greater than the number of workers."""
+        slices = [
+            self.shuttle[key][env_id][step + 1][None, :]
+            for env_id, step in self.env_plan
+        ]
+        batch_da = da.stack(slices, axis=0)
+        batch_np = self.dask_client.persist(batch_da)
+        wait(batch_np)
 
-        # Collect data from per-trajectory format
-        result = []
-        for ti, si in zip(traj_indices, step_indices):
-            if ti < 0 or ti >= len(self):
-                raise IndexError(
-                    f"Trajectory index {ti} out of bounds for dataset with {len(self)} trajectories"
-                )
+    def fetch(self, idx: list[int], key: Optional[str] = None) -> np.ndarray:
+        # TODO: return all the data in the slice if key is None
+        assert key is not None
+        assert len(idx) == self.num_envs
 
-            traj_group = self.root[f"traj_{ti:04d}"]
-            if data_type == "observations":
-                data_group = traj_group["observations"]
-            else:
-                if "actions" not in traj_group:
-                    raise KeyError(f"Actions not available for trajectory {ti}")
-                data_group = traj_group["actions"]
+        slices = [
+            self.shuttle[key][env_id][step][None, :] for env_id, step in self.env_plan
+        ]
+        batch_da = da.stack(slices, axis=0)
+        batch_np = batch_da.persist()
 
-            if key not in data_group:
-                raise KeyError(
-                    f"Key '{key}' not found in {data_type} for trajectory {ti}"
-                )
+        # wait for the current batch to be computed
+        wait(batch_np)
 
-            traj_data = data_group[key]
-            if si < 0 or si >= traj_data.shape[0]:
-                raise IndexError(
-                    f"Step index {si} out of bounds for trajectory {ti} with length {traj_data.shape[0]}"
-                )
-            result.append(np.array(traj_data[si]))
+        # prefetch the next step
+        # self._maybe_prefetch(key)
 
-        result = np.stack(result)
-        return torch.from_numpy(result).to(self.device)
+        return np.array(batch_np.compute())

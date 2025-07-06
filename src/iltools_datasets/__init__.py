@@ -1,22 +1,14 @@
 """Init for src/imtools_datasets."""
 
-from .base_loader import BaseTrajectoryDataset, BaseTrajectoryLoader
+from .base_loader import BaseDataset, BaseLoader
 from .loco_mujoco.loader import LocoMuJoCoLoader
-from .dataset_types import DiskBackedTrajectoryDataset, ZarrBackedTrajectoryDataset
-from .export_utils import export_trajectories_to_disk, export_trajectories_to_zarr
-from .windowed_dataset import WindowedTrajectoryDataset
-from .dataset_manager import TrajectoryDatasetManager
+from .storage import VectorizedTrajectoryDataset
 import logging
 
 logging.basicConfig(level=logging.ERROR)
 __all__ = [
-    "BaseTrajectoryDataset",
-    "BaseTrajectoryLoader",
+    "BaseDataset",
+    "BaseLoader",
     "LocoMuJoCoLoader",
-    "ZarrBackedTrajectoryDataset",
-    "DiskBackedTrajectoryDataset",
-    "WindowedTrajectoryDataset",
-    "export_trajectories_to_disk",
-    "export_trajectories_to_zarr",
-    "TrajectoryDatasetManager",
+    "VectorizedTrajectoryDataset",
 ]

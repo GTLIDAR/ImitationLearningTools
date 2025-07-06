@@ -6,10 +6,10 @@ from typing import List, Dict, Any
 from iltools_core.trajectory import Trajectory
 from iltools_core.metadata_schema import DatasetMeta
 from torch.utils.data import Dataset as TorchDataset
-from iltools_datasets.base_loader import BaseTrajectoryLoader, BaseTrajectoryDataset
+from iltools_datasets.base_loader import BaseLoader
 
 
-class AmassLoader(BaseTrajectoryLoader):
+class AmassLoader(BaseLoader):
     """
     Loads trajectories from the AMASS dataset.
     """
@@ -98,7 +98,7 @@ class AmassLoader(BaseTrajectoryLoader):
 
 
 # PyTorch Dataset for AmassLoader
-class AmassTrajectoryDataset(BaseTrajectoryDataset):
+class AmassTrajectoryDataset(BaseDataset):
     def __init__(self, loader: AmassLoader, device="cpu"):
         self.loader = loader
         self.device = device

@@ -423,7 +423,7 @@ def test_loader_to_dataset_conversion_simple(tmp_path, visualize_enabled):
     When visualization is enabled, shows 500 steps at 50 Hz for both loader trajectory
     and dataset trajectory to validate data preservation and frequency consistency.
     """
-    from iltools_datasets.base_loader import BaseTrajectoryLoader
+    from iltools_datasets.base_loader import BaseLoader
 
     print("=== SIMPLE LOADER TO DATASET TEST ===")
 
@@ -462,7 +462,7 @@ def test_loader_to_dataset_conversion_simple(tmp_path, visualize_enabled):
         f"Truncating trajectory to {max_trajectory_length} timesteps for fast testing"
     )
 
-    class MinimalLoader(BaseTrajectoryLoader):
+    class MinimalLoader(BaseLoader):
         def __init__(self, base_loader, max_length=500):
             self.base_loader = base_loader
             self.max_length = max_length
@@ -561,9 +561,9 @@ def test_loader_to_dataset_conversion_simple(tmp_path, visualize_enabled):
         )
 
         # Basic validation - just check that data exists and has right window size
-        assert sample["observations"]["qpos"].shape[0] == window_size, (
-            f"Expected window size {window_size}, got {sample['observations']['qpos'].shape[0]}"
-        )
+        assert (
+            sample["observations"]["qpos"].shape[0] == window_size
+        ), f"Expected window size {window_size}, got {sample['observations']['qpos'].shape[0]}"
 
         # === VISUAL INSPECTION ===
         print("\n=== VISUAL INSPECTION ===")

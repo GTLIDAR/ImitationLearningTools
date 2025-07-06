@@ -64,38 +64,38 @@ class BaseDataset(TorchDataset, ABC):
     contains trajectory "walk_0", "walk_1", etc.
     """
 
-    @abstractmethod
-    def __len__(self) -> int:
-        """
-        Returns the number of trajectories in the dataset.
-        """
-        ...
+    # @abstractmethod
+    # def __len__(self) -> int:
+    #     """
+    #     Returns the number of trajectories in the dataset.
+    #     """
+    #     ...
 
-    @abstractmethod
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """
-        Returns a trajectory from the dataset.
-        """
-        ...
+    # @abstractmethod
+    # def __getitem__(self, idx: int) -> Dict[str, Any]:
+    #     """
+    #     Returns a trajectory from the dataset.
+    #     """
+    #     ...
 
-    @property
-    @abstractmethod
-    def metadata(self) -> DatasetMeta:
-        """
-        Returns the metadata of the dataset.
-        """
-        ...
+    # @property
+    # @abstractmethod
+    # def metadata(self) -> DatasetMeta:
+    #     """
+    #     Returns the metadata of the dataset.
+    #     """
+    #     ...
 
-    @abstractmethod
-    def get_window(self, idx: int, start: int, length: int) -> Dict[str, Any]:
-        """
-        Returns a window of a trajectory from the dataset.
-        """
-        ...
+    # @abstractmethod
+    # def get_window(self, idx: int, start: int, length: int) -> Dict[str, Any]:
+    #     """
+    #     Returns a window of a trajectory from the dataset.
+    #     """
+    #     ...
 
-    @abstractmethod
-    def as_loader(self, **kwargs) -> BaseLoader:
-        """
-        Returns a loader from the dataset.
-        """
-        ...
+    # @abstractmethod
+    # def as_loader(self, **kwargs) -> BaseLoader:
+    #     """
+    #     Returns a loader from the dataset.
+    #     """
+    #     ...

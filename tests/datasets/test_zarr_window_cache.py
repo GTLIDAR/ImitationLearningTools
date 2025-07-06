@@ -463,12 +463,12 @@ def test_zarr_window_cache_with_unitree_squatting(tmp_path, visualize_enabled):
     # Create truncated loader for faster processing (similar to previous test)
     max_trajectory_length = 600  # Use 600 timesteps to ensure enough for testing
 
-    from iltools_datasets.base_loader import BaseTrajectoryLoader
+    from iltools_datasets.base_loader import BaseLoader
     from iltools_core.metadata_schema import DatasetMeta
     from iltools_core.trajectory import Trajectory
     from typing import Optional
 
-    class TruncatedSquattingLoader(BaseTrajectoryLoader):
+    class TruncatedSquattingLoader(BaseLoader):
         def __init__(self, base_loader, max_length=600):
             self.base_loader = base_loader
             self.max_length = max_length

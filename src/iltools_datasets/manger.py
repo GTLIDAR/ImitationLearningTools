@@ -5,12 +5,12 @@ from typing import Any, Optional, Union, List, Dict
 
 import torch
 from tensordict import TensorDict
+from omegaconf import DictConfig
 
 from iltools_datasets.amass.loader import AmassLoader
 from iltools_datasets.trajopt.loader import TrajoptLoader
 from iltools_datasets.loco_mujoco.loader import LocoMuJoCoLoader
-from iltools_datasets.windowed_dataset import WindowedTrajectoryDataset
-from iltools_datasets.export_utils import export_trajectories_to_zarr
+from iltools_datasets.storage import VectorizedTrajectoryDataset
 
 LoaderType = Union["LocoMuJoCoLoader", "AmassLoader", "TrajoptLoader"]
 
@@ -32,7 +32,7 @@ class TrajectoryDatasetManager:
         """
         self.cfg = cfg
         self.num_envs = num_envs
-        self.device = device
+        self._device = device  # Use private attribute to avoid descriptor issue
 
         # Core configuration
         self.dataset_path = self._validate_dataset_path(cfg)
@@ -46,11 +46,8 @@ class TrajectoryDatasetManager:
         self.env2traj = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.env2step = torch.zeros(num_envs, dtype=torch.long, device=device)
 
-        # Cache trajectory info
-        self.traj_lengths = torch.tensor(
-            self.dataset.lengths, device=device, dtype=torch.long
-        )
-        self.num_trajectories = len(self.traj_lengths)
+        # Cache trajectory info from dataset
+        self.num_trajectories = len(self.dataset.available_trajectories)
 
         # Assignment tracking for round-robin
         self._round_robin_counter = 0
@@ -58,6 +55,11 @@ class TrajectoryDatasetManager:
         print(
             f"[TrajectoryDatasetManager] Initialized with {self.num_trajectories} trajectories, {num_envs} envs"
         )
+
+    @property
+    def device(self) -> torch.device:
+        """Get the device."""
+        return self._device
 
     def reset_trajectories(self, env_ids: Optional[torch.Tensor] = None) -> None:
         """
@@ -95,15 +97,24 @@ class TrajectoryDatasetManager:
                 self.env2traj[env_id] = self.assignment_sequence[seq_idx]
         elif self.assignment_strategy == "curriculum":
             # Simple curriculum: start with shorter trajectories
-            sorted_indices = torch.argsort(self.traj_lengths)
-            self.env2traj[env_ids] = sorted_indices[env_ids % self.num_trajectories]
+            # For now, just use sequential as we don't have length info readily available
+            self.env2traj[env_ids] = env_ids % self.num_trajectories
         else:
             raise ValueError(f"Unknown assignment strategy: {self.assignment_strategy}")
 
         # Reset step counters
         self.env2step[env_ids] = 0
 
-    def get_reference_data(self) -> TensorDict:
+        # Update dataset references
+        env_to_traj = {
+            env_id.item(): self.env2traj[env_id].item() for env_id in env_ids
+        }
+        env_to_step = {
+            env_id.item(): self.env2step[env_id].item() for env_id in env_ids
+        }
+        self.dataset.update_references(env_to_traj=env_to_traj, env_to_step=env_to_step)
+
+    def get_reference_data(self, target_joints) -> TensorDict:
         """
         Get the reference data for all environments with extracted COM and joint information.
 
@@ -118,50 +129,41 @@ class TrajectoryDatasetManager:
                 - raw_qpos: Raw qpos data (num_envs, qpos_dim)
                 - raw_qvel: Raw qvel data (num_envs, qvel_dim) if available
         """
-        # Get current trajectory and step for each env
-        current_trajs = self.env2traj
-        current_steps = self.env2step
+        # Get current step indices for all environments
+        current_steps = list(range(self.num_envs))
 
-        # Fetch raw data using the dataset's batch interface
-        raw_data = self.dataset.batch_get(current_trajs, current_steps)
+        # Fetch raw data using the dataset's fetch interface
+        qpos_data = self.dataset.fetch(
+            current_steps, key="qpos"
+        )  # Shape: (num_envs, qpos_dim)
+        qvel_data = None
+        try:
+            qvel_data = self.dataset.fetch(
+                current_steps, key="qvel"
+            )  # Shape: (num_envs, qvel_dim)
+        except (KeyError, ValueError):
+            # qvel might not be available
+            pass
 
-        # Extract data from the flat structure - use getattr to avoid typing issues
-        qpos = getattr(raw_data, "get", lambda x: raw_data[x])(
-            "observations/qpos"
-        )  # Shape: (num_envs, window_size, qpos_dim)
-        qvel = getattr(
-            raw_data,
-            "get",
-            lambda x: raw_data.get(x, None) if hasattr(raw_data, "get") else None,
-        )("observations/qvel")  # Shape: (num_envs, window_size, qvel_dim)
-
-        # Take the first frame of each window for current reference
-        current_qpos = qpos[:, 0]  # (num_envs, qpos_dim)
-        current_qvel = qvel[:, 0] if qvel is not None else None  # (num_envs, qvel_dim)
+        # Convert to torch tensors
+        qpos = torch.from_numpy(qpos_data).to(self.device)
+        qvel = (
+            torch.from_numpy(qvel_data).to(self.device)
+            if qvel_data is not None
+            else None
+        )
 
         # Extract COM data (first 7 elements: x, y, z, qw, qx, qy, qz)
-        com_pos = current_qpos[:, :3]  # (num_envs, 3)
-        com_quat = current_qpos[:, 3:7]  # (num_envs, 4) - qw, qx, qy, qz
+        com_pos = qpos[:, :3]  # (num_envs, 3)
+        com_quat = qpos[:, 3:7]  # (num_envs, 4) - qw, qx, qy, qz
 
         # Extract COM velocities (first 6 elements: vx, vy, vz, wx, wy, wz)
-        com_lin_vel = (
-            current_qvel[:, :3]
-            if current_qvel is not None
-            else torch.zeros_like(com_pos)
-        )
-        com_ang_vel = (
-            current_qvel[:, 3:6]
-            if current_qvel is not None
-            else torch.zeros_like(com_pos)
-        )
+        com_lin_vel = qvel[:, :3] if qvel is not None else torch.zeros_like(com_pos)
+        com_ang_vel = qvel[:, 3:6] if qvel is not None else torch.zeros_like(com_pos)
 
         # Extract joint positions and velocities (skip first 7 elements for COM)
-        joint_pos = current_qpos[:, 7:]  # (num_envs, num_joints)
-        joint_vel = (
-            current_qvel[:, 6:]
-            if current_qvel is not None
-            else torch.zeros_like(joint_pos)
-        )
+        joint_pos = qpos[:, 7:]  # (num_envs, num_joints)
+        joint_vel = qvel[:, 6:] if qvel is not None else torch.zeros_like(joint_pos)
 
         # Create TensorDict with extracted data
         reference_data = TensorDict(
@@ -172,8 +174,8 @@ class TrajectoryDatasetManager:
                 "com_ang_vel": com_ang_vel,
                 "joint_pos": joint_pos,
                 "joint_vel": joint_vel,
-                "raw_qpos": current_qpos,
-                "raw_qvel": current_qvel,
+                "raw_qpos": qpos,
+                "raw_qvel": qvel if qvel is not None else torch.zeros_like(qpos),
             },
             batch_size=[self.num_envs],
             device=self.device,
@@ -182,9 +184,16 @@ class TrajectoryDatasetManager:
         # Increment step counters
         self.env2step += 1
 
-        # Handle trajectory completion - reset environments that have reached the end
-        max_steps = self.traj_lengths[current_trajs] - 1
-        completed_envs = self.env2step > max_steps
+        # Update dataset with new step positions
+        env_to_step = {
+            env_id: self.env2step[env_id].item() for env_id in range(self.num_envs)
+        }
+        self.dataset.update_references(env_to_step=env_to_step)
+
+        # Handle trajectory completion - for now, just reset to beginning
+        # TODO: Implement proper trajectory length tracking
+        max_steps = 1000  # Placeholder - should get from dataset metadata
+        completed_envs = self.env2step >= max_steps
 
         if torch.any(completed_envs):
             completed_env_ids = torch.where(completed_envs)[0]
@@ -199,18 +208,29 @@ class TrajectoryDatasetManager:
             raise ValueError("dataset_path must be provided in the config.")
         return dataset_path
 
-    def _initialize_dataset(self, cfg: Any) -> WindowedTrajectoryDataset:
+    def _initialize_dataset(self, cfg: Any) -> VectorizedTrajectoryDataset:
         """Initialize or create the Zarr dataset."""
         if not self._check_zarr_exists():
             self._create_zarr_dataset(cfg)
-            window_size = getattr(cfg, "window_size", 64)
-        else:
-            window_size = self._get_window_size_from_metadata()
 
-        return WindowedTrajectoryDataset(
-            self.dataset_path,
-            window_size=window_size,
-            device=self.device,
+        # Convert cfg to DictConfig if needed
+        if not isinstance(cfg, DictConfig):
+            # Try to convert to DictConfig, fallback to direct usage
+            try:
+                from omegaconf import OmegaConf
+
+                dict_cfg = OmegaConf.create(
+                    cfg.__dict__ if hasattr(cfg, "__dict__") else {}
+                )
+            except:
+                dict_cfg = cfg
+        else:
+            dict_cfg = cfg
+
+        return VectorizedTrajectoryDataset(
+            zarr_path=os.path.join(self.dataset_path, "trajectories.zarr"),
+            num_envs=self.num_envs,
+            cfg=dict_cfg,
         )
 
     def _check_zarr_exists(self) -> bool:
@@ -237,14 +257,29 @@ class TrajectoryDatasetManager:
             )
 
         loader = self._get_loader(loader_type, loader_kwargs)
-        export_trajectories_to_zarr(
-            loader,
-            self.dataset_path,
-            window_size=getattr(cfg, "window_size", 64),
-            control_freq=self._get_control_freq(cfg),
-            desired_horizon_steps=self._get_desired_horizon_steps(cfg),
-            horizon_multiplier=2.0,
-        )
+
+        # Create zarr path
+        zarr_path = os.path.join(self.dataset_path, "trajectories.zarr")
+
+        # Save using the loader's save method
+        loader.save(zarr_path)
+
+        # Create metadata file
+        self._create_metadata_file(loader, cfg)
+
+    def _create_metadata_file(self, loader: LoaderType, cfg: Any) -> None:
+        """Create metadata.json file."""
+        metadata = {
+            "window_size": getattr(cfg, "window_size", 64),
+            "control_freq": self._get_control_freq(cfg),
+            "desired_horizon_steps": self._get_desired_horizon_steps(cfg),
+            "loader_type": type(loader).__name__,
+            "num_trajectories": len(loader),
+        }
+
+        meta_file = os.path.join(self.dataset_path, "metadata.json")
+        with open(meta_file, "w") as f:
+            json.dump(metadata, f, indent=2)
 
     def _get_loader(
         self, loader_type: str, loader_kwargs: dict[str, Any]

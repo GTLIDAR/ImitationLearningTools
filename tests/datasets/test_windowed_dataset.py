@@ -12,9 +12,8 @@ import torch
 import zarr
 from tensordict import TensorDict
 
-from iltools_datasets.windowed_dataset import WindowedTrajectoryDataset, _AsyncLRUCache
-from iltools_datasets.export_utils import export_trajectories_to_zarr_per_trajectory
-from iltools_datasets.base_loader import BaseTrajectoryLoader
+from iltools_datasets.storage import VectorizedTrajectoryDataset
+from iltools_datasets.base_loader import BaseLoader
 from iltools_core.trajectory import Trajectory
 from iltools_core.metadata_schema import DatasetMeta
 
@@ -475,7 +474,7 @@ class TestWindowedTrajectoryDataset:
             assert batch_size == (16,)
 
 
-class DummyLoader(BaseTrajectoryLoader):
+class DummyLoader(BaseLoader):
     def __init__(self, num_trajectories=3, traj_lengths=None):
         if traj_lengths is None:
             traj_lengths = [100, 150, 120]
