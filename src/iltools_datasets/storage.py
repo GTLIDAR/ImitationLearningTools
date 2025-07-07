@@ -1,12 +1,12 @@
 from typing import Optional
 
+import dask.array as da
 import numpy as np
 import zarr
+from dask.distributed import Client, wait
 from omegaconf import DictConfig
+
 from iltools_datasets.base_loader import BaseDataset
-from dask.distributed import Client
-import dask.array as da
-from dask.distributed import wait
 
 
 class VectorizedTrajectoryDataset(BaseDataset):

@@ -1,10 +1,11 @@
 import numpy as np
+import torch
 from pathlib import Path
 from typing import List, Dict, Any
 from iltools_core.trajectory import Trajectory
 from iltools_core.metadata_schema import DatasetMeta
 from torch.utils.data import Dataset as TorchDataset
-from iltools_datasets.base_loader import BaseLoader
+from iltools_datasets.base_loader import BaseLoader, BaseDataset
 
 
 class TrajoptLoader(BaseLoader):
@@ -17,6 +18,10 @@ class TrajoptLoader(BaseLoader):
         self._trajectory_lengths = []
         self._metadata = self._load_metadata()
         self._file_list = sorted(list(self.data_path.glob("*.npz")))
+        self._dt = 0.02
+        self._joint_names = ["joint1", "joint2", "joint3"]
+        self._body_names = ["body1", "body2"]
+        self._site_names = ["site1", "site2"]
 
     def _load_metadata(self) -> DatasetMeta:
         """
@@ -28,9 +33,13 @@ class TrajoptLoader(BaseLoader):
             version="1.0.0",
             citation="TODO",
             num_trajectories=len(self._file_list),
-            observation_keys=["qpos", "qvel"],
-            action_keys=["action"],
             trajectory_lengths=self._trajectory_lengths,
+            dt=self._dt,
+            keys=["qpos", "qvel", "action"],
+            joint_names=self._joint_names,
+            body_names=self._body_names,
+            site_names=self._site_names,
+            metadata={"trajopt": True},
         )
 
     def __len__(self):

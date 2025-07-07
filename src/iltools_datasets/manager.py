@@ -1,7 +1,8 @@
 from abc import ABC
+from enum import unique
 import os
 import json
-from typing import Any, Optional, Union, List, Dict
+from typing import Any, Optional, Union, List, Dict, Tuple
 
 import torch
 from tensordict import TensorDict
@@ -21,7 +22,7 @@ class TrajectoryDatasetManager:
     Provides a clean interface for the ImitationRLEnv with automatic COM and joint extraction.
     """
 
-    def __init__(self, cfg: Any, num_envs: int, device: torch.device) -> None:
+    def __init__(self, cfg: DictConfig, num_envs: int, device: torch.device) -> None:
         """
         Initialize the trajectory dataset manager.
 
@@ -31,6 +32,20 @@ class TrajectoryDatasetManager:
             device: Torch device
         """
         self.cfg = cfg
+        # store the joint sequence we need to export to, note that this must use the same joint names as the dataset
+        assert cfg.target_joint_names is not None, (
+            "target_joint_names must be provided in the config."
+        )
+        self.target_joint_names = cfg.target_joint_names
+
+        # store the joint sequence we need to extract from the dataset.
+        # This list of names might not be the same as provided in the dataset,
+        # but should match the name string convention specified in target_joint_names
+        assert cfg.reference_joint_names is not None, (
+            "reference_joint_names must be provided in the config."
+        )
+        self.reference_joint_names = cfg.reference_joint_names
+
         self.num_envs = num_envs
         self._device = device  # Use private attribute to avoid descriptor issue
 
@@ -51,6 +66,53 @@ class TrajectoryDatasetManager:
 
         # Assignment tracking for round-robin
         self._round_robin_counter = 0
+
+        # Map reference to target joint names
+        self.ref_to_target_map, self.target_to_ref_map = self._map_reference_to_target(
+            self.reference_joint_names, self.target_joint_names
+        )
+        self.target_mask = torch.zeros(
+            len(self.target_joint_names), dtype=torch.bool, device=device
+        )
+        self.target_mask[self.ref_to_target_map] = True
+
+        # Memory allocate for important data
+        self.joint_pos = torch.empty(
+            num_envs, len(self.target_joint_names), device=device
+        )
+        self.joint_vel = torch.empty(
+            num_envs, len(self.target_joint_names), device=device
+        )
+        self.root_pos = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
+        self.root_quat = torch.empty(num_envs, 4, device=device, dtype=torch.float32)
+        self.root_lin_vel = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
+        self.root_ang_vel = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
+
+        # Pre-allocate reference data TensorDict for better performance
+        self.reference_data = TensorDict(
+            {
+                "root_pos": self.root_pos,
+                "root_quat": self.root_quat,
+                "root_lin_vel": self.root_lin_vel,
+                "root_ang_vel": self.root_ang_vel,
+                "joint_pos": self.joint_pos,
+                "joint_vel": self.joint_vel,
+                "raw_qpos": torch.empty(
+                    num_envs,
+                    len(self.reference_joint_names),
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                "raw_qvel": torch.empty(
+                    num_envs,
+                    len(self.reference_joint_names),
+                    device=device,
+                    dtype=torch.float32,
+                ),
+            },
+            batch_size=[num_envs],
+            device=device,
+        )
 
         print(
             f"[TrajectoryDatasetManager] Initialized with {self.num_trajectories} trajectories, {num_envs} envs"
@@ -107,14 +169,14 @@ class TrajectoryDatasetManager:
 
         # Update dataset references
         env_to_traj = {
-            env_id.item(): self.env2traj[env_id].item() for env_id in env_ids
+            int(env_id.item()): int(self.env2traj[env_id].item()) for env_id in env_ids
         }
         env_to_step = {
-            env_id.item(): self.env2step[env_id].item() for env_id in env_ids
+            int(env_id.item()): int(self.env2step[env_id].item()) for env_id in env_ids
         }
         self.dataset.update_references(env_to_traj=env_to_traj, env_to_step=env_to_step)
 
-    def get_reference_data(self, target_joints) -> TensorDict:
+    def get_reference_data(self) -> TensorDict:
         """
         Get the reference data for all environments with extracted COM and joint information.
 
@@ -152,54 +214,42 @@ class TrajectoryDatasetManager:
             if qvel_data is not None
             else None
         )
+        self.reference_data["raw_qpos"] = qpos
+        self.reference_data["raw_qvel"] = qvel
 
-        # Extract COM data (first 7 elements: x, y, z, qw, qx, qy, qz)
-        com_pos = qpos[:, :3]  # (num_envs, 3)
-        com_quat = qpos[:, 3:7]  # (num_envs, 4) - qw, qx, qy, qz
+        # Extract root data (first 7 elements: x, y, z, qw, qx, qy, qz)
+        root_pos = qpos[:, :3]  # (num_envs, 3)
+        root_quat = qpos[:, 3:7]  # (num_envs, 4) - qw, qx, qy, qz
+        self.reference_data["root_pos"] = root_pos
+        self.reference_data["root_quat"] = root_quat
 
         # Extract COM velocities (first 6 elements: vx, vy, vz, wx, wy, wz)
-        com_lin_vel = qvel[:, :3] if qvel is not None else torch.zeros_like(com_pos)
-        com_ang_vel = qvel[:, 3:6] if qvel is not None else torch.zeros_like(com_pos)
+        root_lin_vel = qvel[:, :3] if qvel is not None else torch.zeros_like(root_pos)
+        root_ang_vel = qvel[:, 3:6] if qvel is not None else torch.zeros_like(root_pos)
+        self.reference_data["root_lin_vel"] = root_lin_vel
+        self.reference_data["root_ang_vel"] = root_ang_vel
 
         # Extract joint positions and velocities (skip first 7 elements for COM)
         joint_pos = qpos[:, 7:]  # (num_envs, num_joints)
         joint_vel = qvel[:, 6:] if qvel is not None else torch.zeros_like(joint_pos)
-
-        # Create TensorDict with extracted data
-        reference_data = TensorDict(
-            {
-                "com_pos": com_pos,
-                "com_quat": com_quat,
-                "com_lin_vel": com_lin_vel,
-                "com_ang_vel": com_ang_vel,
-                "joint_pos": joint_pos,
-                "joint_vel": joint_vel,
-                "raw_qpos": qpos,
-                "raw_qvel": qvel if qvel is not None else torch.zeros_like(qpos),
-            },
-            batch_size=[self.num_envs],
-            device=self.device,
-        )
+        self.joint_pos[self.ref_to_target_map] = joint_pos[self.target_to_ref_map]
+        self.joint_vel[self.ref_to_target_map] = joint_vel[self.target_to_ref_map]
+        self.joint_pos[~self.target_mask] = torch.nan
+        self.joint_vel[~self.target_mask] = torch.nan
+        self.reference_data["joint_pos"] = self.joint_pos.clone()
+        self.reference_data["joint_vel"] = self.joint_vel.clone()
 
         # Increment step counters
         self.env2step += 1
 
         # Update dataset with new step positions
         env_to_step = {
-            env_id: self.env2step[env_id].item() for env_id in range(self.num_envs)
+            int(env_id): int(self.env2step[env_id].item())
+            for env_id in range(self.num_envs)
         }
         self.dataset.update_references(env_to_step=env_to_step)
 
-        # Handle trajectory completion - for now, just reset to beginning
-        # TODO: Implement proper trajectory length tracking
-        max_steps = 1000  # Placeholder - should get from dataset metadata
-        completed_envs = self.env2step >= max_steps
-
-        if torch.any(completed_envs):
-            completed_env_ids = torch.where(completed_envs)[0]
-            self.reset_trajectories(completed_env_ids)
-
-        return reference_data
+        return self.reference_data
 
     def _validate_dataset_path(self, cfg: Any) -> str:
         """Validate and return the dataset path from config."""
@@ -222,7 +272,7 @@ class TrajectoryDatasetManager:
                 dict_cfg = OmegaConf.create(
                     cfg.__dict__ if hasattr(cfg, "__dict__") else {}
                 )
-            except:
+            except:  # noqa: E722
                 dict_cfg = cfg
         else:
             dict_cfg = cfg
@@ -288,9 +338,11 @@ class TrajectoryDatasetManager:
         if loader_type == "loco_mujoco":
             return LocoMuJoCoLoader(**loader_kwargs)
         elif loader_type == "amass":
-            return AmassLoader(**loader_kwargs)
+            # return AmassLoader(**loader_kwargs)
+            raise NotImplementedError("AmassLoader is not implemented")
         elif loader_type == "trajopt":
-            return TrajoptLoader(**loader_kwargs)
+            # return TrajoptLoader(**loader_kwargs)
+            raise NotImplementedError("TrajoptLoader is not implemented")
         else:
             raise ValueError(f"Unknown loader_type: {loader_type}")
 
@@ -301,3 +353,35 @@ class TrajectoryDatasetManager:
     def _get_desired_horizon_steps(self, cfg: Any) -> int:
         """Compute the desired number of horizon steps from the config."""
         return int(cfg.episode_length_s / (cfg.sim.dt * cfg.decimation))
+
+    def _map_reference_to_target(
+        self, reference_joint_names: List[str], target_joint_names: List[str]
+    ) -> Tuple[List[int], List[int]]:
+        """
+        Map the reference joint names to the target joint names; and return the target tensor and the mapping as a list of indices, so that the target tensor can be indexed by the indices, e.g., tensor[inv_map] = reference_tensor[map] produces a tensor with the same shape as the target tensor but the values are the same as the reference tensor re-ordered. Also, tensor[~inv_map] = NaN.
+
+        Args:
+            reference_joint_names: List of reference joint names
+            target_joint_names: List of target joint names
+
+        Returns:
+            Tuple containing:
+                - mapping: List of indices for mapping
+                - inv_map: List of indices for inverse mapping
+        """
+        # Create mapping from reference to target joint positions
+        mapping = []
+        inv_map = []
+        all_joint_names = list(set(target_joint_names + reference_joint_names))
+        for joint_name in all_joint_names:
+            if (
+                joint_name not in target_joint_names
+                or joint_name not in reference_joint_names
+            ):
+                continue
+            map_idx = target_joint_names.index(joint_name)
+            mapping.append(map_idx)
+            inv_map_idx = reference_joint_names.index(joint_name)
+            inv_map.append(inv_map_idx)
+
+        return mapping, inv_map
