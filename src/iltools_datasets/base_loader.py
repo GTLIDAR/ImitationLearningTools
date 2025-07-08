@@ -1,11 +1,9 @@
-import warnings
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 from torch.utils.data import Dataset as TorchDataset
 
 from iltools_core.metadata_schema import DatasetMeta
-from iltools_core.trajectory import Trajectory
 
 
 class BaseLoader(ABC):

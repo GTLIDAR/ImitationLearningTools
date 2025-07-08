@@ -1,5 +1,5 @@
 import os
-from typing import Any, Iterator, List, Optional
+from typing import Any
 
 import numpy as np
 import zarr
@@ -15,7 +15,6 @@ from omegaconf import DictConfig
 from zarr import storage
 
 from iltools_core.metadata_schema import DatasetMeta
-from iltools_core.trajectory import Trajectory as ILTTrajectory
 from iltools_datasets.base_loader import (
     BaseDataset,
     BaseLoader,
@@ -109,7 +108,7 @@ class LocoMuJoCoLoader(BaseLoader):
             "site_xmat",
         ]
 
-        traj_data_lengths = [
+        traj_data_lengths: list[int] = [
             self.env.th.traj.data.split_points[i + 1]  # type: ignore
             - self.env.th.traj.data.split_points[i]  # type: ignore
             for i in range(len(self.env.th.traj.data.split_points) - 1)  # type: ignore
@@ -169,7 +168,7 @@ class LocoMuJoCoLoader(BaseLoader):
         shard_size: int = kwargs.get("shard_size", 100)
         if not os.path.exists(path):
             os.makedirs(path)
-        store = storage.LocalStore(path)
+        store = storage.DirectoryStore(path)
         root = zarr.group(store=store, overwrite=False)
         locomujoco_group = root.create_group("loco_mujoco")
 
@@ -221,7 +220,7 @@ class LocoMuJoCoLoader(BaseLoader):
                 sliced_value = np.array(value[traj_start:traj_end])
                 chunks: list[int] = [chunk_size] + list(sliced_value.shape[1:])
                 shards: list[int] = [shard_size] + list(sliced_value.shape[1:])
-                trajectory_data = trajectory_group.create_array(
+                trajectory_data = trajectory_group.create_dataset(
                     key,
                     shape=sliced_value.shape,
                     dtype=sliced_value.dtype,
@@ -229,5 +228,3 @@ class LocoMuJoCoLoader(BaseLoader):
                     shards=shards,
                 )
                 trajectory_data[:] = sliced_value
-        print(f"metadata: {sorted(locomujoco_group.attrs)}")
-        print(f"root: {root.tree()}")

@@ -1,17 +1,15 @@
-from abc import ABC
-from enum import unique
-import os
 import json
-from typing import Any, Optional, Union, List, Dict, Tuple
+import os
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
-from tensordict import TensorDict
 from omegaconf import DictConfig
+from tensordict import TensorDict
 
 from iltools_datasets.amass.loader import AmassLoader
-from iltools_datasets.trajopt.loader import TrajoptLoader
 from iltools_datasets.loco_mujoco.loader import LocoMuJoCoLoader
 from iltools_datasets.storage import VectorizedTrajectoryDataset
+from iltools_datasets.trajopt.loader import TrajoptLoader
 
 LoaderType = Union["LocoMuJoCoLoader", "AmassLoader", "TrajoptLoader"]
 
@@ -47,7 +45,7 @@ class TrajectoryDatasetManager:
         self.reference_joint_names = cfg.reference_joint_names
 
         self.num_envs = num_envs
-        self._device = device  # Use private attribute to avoid descriptor issue
+        self._device = device  # type: ignore
 
         # Core configuration
         self.dataset_path = self._validate_dataset_path(cfg)
@@ -150,13 +148,13 @@ class TrajectoryDatasetManager:
             ) % self.num_trajectories
         elif self.assignment_strategy == "sequence":
             # Use predefined sequence
-            if self.assignment_sequence is None:
-                raise ValueError(
-                    "assignment_sequence must be provided when using 'sequence' strategy"
-                )
-            for i, env_id in enumerate(env_ids):
-                seq_idx = env_id.item() % len(self.assignment_sequence)
-                self.env2traj[env_id] = self.assignment_sequence[seq_idx]
+            assert self.assignment_sequence is not None, (
+                "assignment_sequence must be provided when using 'sequence' strategy"
+            )
+            assert isinstance(self.assignment_sequence, list)
+            for env_id in env_ids:
+                seq_idx = int(env_id)
+                self.env2traj[env_id] = self.assignment_sequence[seq_idx]  # type: ignore
         elif self.assignment_strategy == "curriculum":
             # Simple curriculum: start with shorter trajectories
             # For now, just use sequential as we don't have length info readily available
@@ -169,10 +167,10 @@ class TrajectoryDatasetManager:
 
         # Update dataset references
         env_to_traj = {
-            int(env_id.item()): int(self.env2traj[env_id].item()) for env_id in env_ids
+            int(env_id): int(self.env2traj[env_id]) for env_id in range(self.num_envs)
         }
         env_to_step = {
-            int(env_id.item()): int(self.env2step[env_id].item()) for env_id in env_ids
+            int(env_id): int(self.env2step[env_id]) for env_id in range(self.num_envs)
         }
         self.dataset.update_references(env_to_traj=env_to_traj, env_to_step=env_to_step)
 
@@ -232,10 +230,15 @@ class TrajectoryDatasetManager:
         # Extract joint positions and velocities (skip first 7 elements for COM)
         joint_pos = qpos[:, 7:]  # (num_envs, num_joints)
         joint_vel = qvel[:, 6:] if qvel is not None else torch.zeros_like(joint_pos)
-        self.joint_pos[self.ref_to_target_map] = joint_pos[self.target_to_ref_map]
-        self.joint_vel[self.ref_to_target_map] = joint_vel[self.target_to_ref_map]
-        self.joint_pos[~self.target_mask] = torch.nan
-        self.joint_vel[~self.target_mask] = torch.nan
+
+        self.joint_pos[..., self.ref_to_target_map] = joint_pos[
+            ..., self.target_to_ref_map
+        ]
+        self.joint_vel[..., self.ref_to_target_map] = joint_vel[
+            ..., self.target_to_ref_map
+        ]
+        self.joint_pos[..., ~self.target_mask] = torch.nan
+        self.joint_vel[..., ~self.target_mask] = torch.nan
         self.reference_data["joint_pos"] = self.joint_pos.clone()
         self.reference_data["joint_vel"] = self.joint_vel.clone()
 
@@ -286,8 +289,7 @@ class TrajectoryDatasetManager:
     def _check_zarr_exists(self) -> bool:
         """Check if both the Zarr directory and metadata file exist."""
         zarr_dir = os.path.join(self.dataset_path, "trajectories.zarr")
-        meta_file = os.path.join(self.dataset_path, "metadata.json")
-        return os.path.exists(zarr_dir) and os.path.exists(meta_file)
+        return os.path.exists(zarr_dir)
 
     def _get_window_size_from_metadata(self) -> int:
         """Read window_size from metadata.json."""
@@ -314,22 +316,22 @@ class TrajectoryDatasetManager:
         # Save using the loader's save method
         loader.save(zarr_path)
 
-        # Create metadata file
-        self._create_metadata_file(loader, cfg)
+        # # Create metadata file
+        # self._create_metadata_file(loader, cfg)
 
-    def _create_metadata_file(self, loader: LoaderType, cfg: Any) -> None:
-        """Create metadata.json file."""
-        metadata = {
-            "window_size": getattr(cfg, "window_size", 64),
-            "control_freq": self._get_control_freq(cfg),
-            "desired_horizon_steps": self._get_desired_horizon_steps(cfg),
-            "loader_type": type(loader).__name__,
-            "num_trajectories": len(loader),
-        }
+    # def _create_metadata_file(self, loader: LoaderType, cfg: Any) -> None:
+    #     """Create metadata.json file."""
+    #     metadata = {
+    #         "window_size": getattr(cfg, "window_size", 64),
+    #         "control_freq": self._get_control_freq(cfg),
+    #         "desired_horizon_steps": self._get_desired_horizon_steps(cfg),
+    #         "loader_type": type(loader).__name__,
+    #         "num_trajectories": len(loader),
+    #     }
 
-        meta_file = os.path.join(self.dataset_path, "metadata.json")
-        with open(meta_file, "w") as f:
-            json.dump(metadata, f, indent=2)
+    #     meta_file = os.path.join(self.dataset_path, "metadata.json")
+    #     with open(meta_file, "w") as f:
+    #         json.dump(metadata, f, indent=2)
 
     def _get_loader(
         self, loader_type: str, loader_kwargs: dict[str, Any]

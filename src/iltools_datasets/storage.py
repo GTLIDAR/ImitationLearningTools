@@ -19,8 +19,6 @@ class VectorizedTrajectoryDataset(BaseDataset):
     def __init__(self, zarr_path: str, num_envs: int, cfg: DictConfig, **kwargs):
         self.dask_client = Client()
         self.zarr_dataset = zarr.open_group(zarr_path, mode="r")
-        print(self.zarr_dataset.tree())
-        print(sorted(self.zarr_dataset["loco_mujoco"].attrs))
         self.num_envs = num_envs
         self.cfg = cfg
         self.window_size = cfg.window_size
@@ -74,7 +72,6 @@ class VectorizedTrajectoryDataset(BaseDataset):
         and the values are the trajectories.
         """
         shuttle: dict[str, list[da.Array]] = {}
-
         typical_trajectory = self.zarr_dataset[self.available_trajectories[0]]
         assert isinstance(typical_trajectory, zarr.Group)
         self.all_keys = sorted(typical_trajectory.keys())
@@ -102,7 +99,7 @@ class VectorizedTrajectoryDataset(BaseDataset):
         for key in self.shuttle.keys():
             for env_id, traj_id in env_to_traj.items():
                 self.shuttle[key][env_id] = da.from_zarr(
-                    self.zarr_dataset[self.available_trajectories[traj_id]]
+                    self.zarr_dataset[self.available_trajectories[traj_id] + "/" + key]
                 )
 
     def _build_env_plan(self):
@@ -147,9 +144,7 @@ class VectorizedTrajectoryDataset(BaseDataset):
         assert key is not None
         assert len(idx) == self.num_envs
 
-        slices = [
-            self.shuttle[key][env_id][step][None, :] for env_id, step in self.env_plan
-        ]
+        slices = [self.shuttle[key][env_id][step] for env_id, step in self.env_plan]
         batch_da = da.stack(slices, axis=0)
         batch_np = batch_da.persist()
 

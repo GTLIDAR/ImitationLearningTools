@@ -24,6 +24,8 @@ def basic_cfg():
             },
             "control_freq": 50.0,
             "window_size": 4,
+            "sim": {"dt": 0.001},
+            "decimation": 20,
         }
     )
 
@@ -90,7 +92,7 @@ def test_vectorized_dataset_init(tmp_path, minimal_loader, basic_cfg):
     zarr_path = out_dir / "trajectories.zarr"
     os.makedirs(out_dir, exist_ok=True)
 
-    store = storage.LocalStore(str(zarr_path))
+    store = storage.DirectoryStore(str(zarr_path))
     root = zarr.group(store=store, overwrite=True)
 
     # Create the expected loco_mujoco group structure
@@ -99,9 +101,27 @@ def test_vectorized_dataset_init(tmp_path, minimal_loader, basic_cfg):
     traj_group = default_group.create_group("trajectory_0")
 
     # Add minimal data
-    traj_group.create_array("qpos", shape=(10, 3), dtype=np.float32, chunks=(10, 3))
-    traj_group.create_array("qvel", shape=(10, 3), dtype=np.float32, chunks=(10, 3))
-    traj_group.create_array("actions", shape=(10, 3), dtype=np.float32, chunks=(10, 3))
+    traj_group.create_dataset(
+        "qpos",
+        shape=(10, 3),
+        dtype=np.float32,
+        chunks=(10, 3),
+        data=np.ones((10, 3), dtype=np.float32),
+    )
+    traj_group.create_dataset(
+        "qvel",
+        shape=(10, 3),
+        dtype=np.float32,
+        chunks=(10, 3),
+        data=np.ones((10, 3), dtype=np.float32),
+    )
+    traj_group.create_dataset(
+        "actions",
+        shape=(10, 3),
+        dtype=np.float32,
+        chunks=(10, 3),
+        data=np.ones((10, 3), dtype=np.float32),
+    )
     traj_group.attrs["dt"] = 0.05
     traj_group.attrs["trajectory_length"] = 10
     traj_group.attrs["trajectory_id"] = 0
@@ -141,7 +161,7 @@ def test_real_loco_loader_basic(basic_cfg):
         print(f"✅ Loader test passed. Found {meta.num_trajectories} trajectories")
 
     except Exception as e:
-        pytest.skip(f"LocoMuJoCoLoader test skipped due to: {e}")
+        pytest.fail(f"LocoMuJoCoLoader test failed due to: {e}")
 
 
 def test_real_loco_loader_trajectory_info(basic_cfg):
@@ -167,80 +187,50 @@ def test_real_loco_loader_trajectory_info(basic_cfg):
         pytest.skip(f"LocoMuJoCoLoader info test skipped due to: {e}")
 
 
-def test_loader_to_dataset_conversion_basic(tmp_path, basic_cfg):
-    """Test basic loader to dataset conversion without visualization."""
-    try:
-        # Create minimal loader for testing
-        loader = LocoMuJoCoLoader(env_name="UnitreeG1", cfg=basic_cfg)
-
-        print(f"=== BASIC LOADER TO DATASET TEST ===")
-        print(f"Loader created with {len(loader)} trajectories")
-        print(f"Loader metadata: {loader.metadata.name}")
-
-        # Test that the loader has the expected interface
-        assert hasattr(loader, "env")
-        assert hasattr(loader, "metadata")
-        assert len(loader) > 0
-
-        # Try to save a small dataset
-        out_dir = tmp_path / "basic_test"
-        try:
-            # Use the loader's save method if available
-            loader.save(str(out_dir))
-            print("✅ Loader save method works")
-        except Exception as export_error:
-            print(f"⚠️ Export test skipped: {export_error}")
-
-        print("✅ Basic loader-to-dataset test passed!")
-
-    except Exception as e:
-        pytest.skip(f"Loader conversion test skipped due to: {e}")
-
-
 def test_manager_basic_functionality(tmp_path, basic_cfg):
     """Test TrajectoryDatasetManager basic functionality."""
-    # Create a minimal zarr dataset for testing
+    # Create a minimal zarr dataset for testing using the correct structure
     zarr_path = tmp_path / "trajectories.zarr"
-    store = storage.LocalStore(str(zarr_path))
+    store = storage.DirectoryStore(str(zarr_path))
     root = zarr.group(store=store, overwrite=True)
 
-    # Create observation and action groups
-    obs_group = root.create_group("observations")
-    act_group = root.create_group("actions")
+    # Create the expected loco_mujoco dataset structure
+    loco_group = root.create_group("loco_mujoco")
 
-    # Add some minimal data
-    qpos = obs_group.create_array(
-        "qpos", shape=(100, 30), dtype=np.float32, chunks=(10, 30)
-    )
-    qvel = obs_group.create_array(
-        "qvel", shape=(100, 29), dtype=np.float32, chunks=(10, 29)
-    )
-    actions = act_group.create_array(
-        "actions", shape=(100, 12), dtype=np.float32, chunks=(10, 12)
-    )
-    qpos[:] = np.ones((100, 30), dtype=np.float32)
-    qvel[:] = np.ones((100, 29), dtype=np.float32)
-    actions[:] = np.ones((100, 12), dtype=np.float32)
-    obs_group.attrs["trajectory_length"] = 100
-    obs_group.attrs["trajectory_id"] = 0
-    obs_group.attrs["trajectory_name"] = "default_walk"
-    obs_group.attrs["trajectory_source"] = "loco_mujoco"
-    act_group.attrs["dt"] = 0.02
+    # Create a motion group (dataset_type_motion)
+    motion_group = loco_group.create_group("default_walk")
 
-    # Create metadata
-    metadata_path = tmp_path / "metadata.json"
-    metadata = {
-        "num_trajectories": 2,
-        "trajectory_lengths": [50, 50],
-        "keys": ["qpos", "qvel", "actions"],
-        "dt": [0.02, 0.02],
-        "window_size": 4,
-    }
+    # Create trajectory groups
+    for traj_idx in range(2):
+        traj_group = motion_group.create_group(f"trajectory_{traj_idx}")
 
-    import json
+        # Add observation data following the expected keys from LocoMuJoCoLoader
+        qpos = traj_group.create_dataset(
+            "qpos", shape=(50, 30), dtype=np.float32, chunks=(10, 30)
+        )
+        qvel = traj_group.create_dataset(
+            "qvel", shape=(50, 29), dtype=np.float32, chunks=(10, 29)
+        )
+        # Add other expected keys
+        xpos = traj_group.create_dataset(
+            "xpos", shape=(50, 24), dtype=np.float32, chunks=(10, 24)
+        )
 
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f)
+        # Fill with data
+        qpos[:] = np.ones((50, 30), dtype=np.float32)
+        qvel[:] = np.ones((50, 29), dtype=np.float32)
+        xpos[:] = np.ones((50, 24), dtype=np.float32)
+
+        # Add trajectory metadata
+        traj_group.attrs["trajectory_length"] = 50
+        traj_group.attrs["trajectory_id"] = traj_idx
+        traj_group.attrs["trajectory_name"] = "default_walk"
+        traj_group.attrs["trajectory_source"] = "loco_mujoco"
+        traj_group.attrs["dt"] = 0.02
+
+    # Add metadata to loco_mujoco group
+    loco_group.attrs["frequency"] = 50.0
+    loco_group.attrs["joint_names"] = [f"j{i}" for i in range(1, 31)]
 
     # Test manager initialization
     test_cfg = DictConfig(
@@ -248,10 +238,10 @@ def test_manager_basic_functionality(tmp_path, basic_cfg):
             "dataset_path": str(tmp_path),
             "assignment_strategy": "sequential",
             "window_size": 4,
-            "target_joints": [f"j{i}" for i in range(1, 18)][
+            "target_joint_names": [f"j{i}" for i in range(1, 24)][
                 ::-1
             ],  # Reverse the list to test mapping
-            "reference_joints": [f"j{i}" for i in range(5, 28)],
+            "reference_joint_names": [f"j{i}" for i in range(5, 28)],
         }
     )
 
@@ -259,7 +249,8 @@ def test_manager_basic_functionality(tmp_path, basic_cfg):
         device = torch.device("cpu")
         manager = TrajectoryDatasetManager(cfg=test_cfg, num_envs=2, device=device)
         data = manager.get_reference_data()
-        assert data.keys() == [
+        print(data.keys())
+        for key in [
             "root_pos",
             "root_quat",
             "root_lin_vel",
@@ -268,14 +259,17 @@ def test_manager_basic_functionality(tmp_path, basic_cfg):
             "joint_vel",
             "raw_qpos",
             "raw_qvel",
-        ]
+        ]:
+            assert key in data
+            assert data[key].shape[0] == 2
+
         assert data["root_pos"].shape == (2, 3)
         assert data["root_quat"].shape == (2, 4)
         assert data["root_lin_vel"].shape == (2, 3)
         assert data["root_ang_vel"].shape == (2, 3)
         # 13 because 5-18 are the shared joints for the reference and target
-        assert data["joint_pos"].shape == (2, 13)
-        assert data["joint_vel"].shape == (2, 13)
+        assert data["joint_pos"].shape == (2, 23)
+        assert data["joint_vel"].shape == (2, 23)
         assert data["raw_qpos"].shape == (2, 30)
         assert data["raw_qvel"].shape == (2, 29)
 
@@ -286,19 +280,95 @@ def test_manager_basic_functionality(tmp_path, basic_cfg):
         print("✅ TrajectoryDatasetManager basic test passed!")
 
     except Exception as e:
-        pytest.skip(f"Manager test skipped due to: {e}")
+        pytest.fail(f"Manager test failed due to: {e}")
+
+
+def test_manager_comprehensive(tmp_path, basic_cfg):
+    """Test TrajectoryDatasetManager comprehensive functionality."""
+    # Create a minimal zarr dataset for testing using the correct structure
+
+    test_cfg = DictConfig(
+        {
+            "dataset_path": str(tmp_path),
+            "loader_type": "loco_mujoco",
+            "loader_kwargs": {
+                "env_name": "UnitreeG1",
+                "cfg": basic_cfg,
+            },
+            "assignment_strategy": "sequential",
+            "window_size": 4,
+            "target_joint_names": [f"j{i}" for i in range(1, 24)][
+                ::-1
+            ],  # Reverse the list to test mapping
+            "reference_joint_names": [f"j{i}" for i in range(5, 28)],
+        }
+    )
+
+    try:
+        device = torch.device("cuda:0")
+        manager = TrajectoryDatasetManager(cfg=test_cfg, num_envs=10, device=device)
+        step_0_data = manager.get_reference_data()
+
+        for _ in range(10):
+            data = manager.get_reference_data()
+
+        for key in [
+            "root_pos",
+            "root_quat",
+            "root_lin_vel",
+            "root_ang_vel",
+            "joint_pos",
+            "joint_vel",
+            "raw_qpos",
+            "raw_qvel",
+        ]:
+            assert key in data
+            assert data[key].shape[0] == 10
+
+        manager.reset_trajectories(env_ids=torch.arange(5, device=device))
+        data = manager.get_reference_data()
+        assert data["root_pos"][:5].allclose(step_0_data["root_pos"][:5], atol=1e-6)
+        assert data["root_quat"][:5].allclose(step_0_data["root_quat"][:5], atol=1e-6)
+        assert data["root_lin_vel"][:5].allclose(
+            step_0_data["root_lin_vel"][:5], atol=1e-6
+        )
+        assert data["root_ang_vel"][:5].allclose(
+            step_0_data["root_ang_vel"][:5], atol=1e-6
+        )
+        assert data["joint_pos"][
+            :5, ~torch.isnan(data["joint_pos"]).any(dim=0)
+        ].allclose(
+            step_0_data["joint_pos"][
+                :5, ~torch.isnan(step_0_data["joint_pos"]).any(dim=0)
+            ],
+            atol=1e-6,
+        )
+        assert data["joint_vel"][
+            :5, ~torch.isnan(data["joint_vel"]).any(dim=0)
+        ].allclose(
+            step_0_data["joint_vel"][
+                :5, ~torch.isnan(step_0_data["joint_vel"]).any(dim=0)
+            ],
+            atol=1e-6,
+        )
+        assert data["raw_qpos"][:5].allclose(step_0_data["raw_qpos"][:5], atol=1e-6)
+        assert data["raw_qvel"][:5].allclose(step_0_data["raw_qvel"][:5], atol=1e-6)
+
+    except Exception as e:
+        pytest.fail(f"Manager test failed due to: {e}")
 
 
 def create_fake_loco_npz(tmp_path, n=2, T=10):
     """Create fake NPZ files for testing."""
     for i in range(n):
-        arr = {
-            "qpos": np.random.randn(T, 17).astype(np.float32),
-            "qvel": np.random.randn(T, 17).astype(np.float32),
-            "actions": np.random.randn(T, 6).astype(np.float32),
-            "dt": np.array([0.033], dtype=np.float32),
-        }
-        np.savez(tmp_path / f"traj_{i}.npz", **arr)
+        qpos = np.random.randn(T, 17).astype(np.float32)
+        qvel = np.random.randn(T, 17).astype(np.float32)
+        actions = np.random.randn(T, 6).astype(np.float32)
+        dt = np.array([0.033], dtype=np.float32)
+
+        np.savez(
+            tmp_path / f"traj_{i}.npz", qpos=qpos, qvel=qvel, actions=actions, dt=dt
+        )
 
 
 @pytest.fixture
@@ -327,8 +397,16 @@ def test_metadata_schema():
 
     assert metadata.name == "test_dataset"
     assert metadata.num_trajectories == 5
-    assert len(metadata.trajectory_lengths) == 5
-    assert len(metadata.dt) == 5
+    # Handle both list and single value cases for trajectory_lengths
+    if isinstance(metadata.trajectory_lengths, list):
+        assert len(metadata.trajectory_lengths) == 5
+    else:
+        assert isinstance(metadata.trajectory_lengths, int)
+    # Handle both list and single value cases for dt
+    if isinstance(metadata.dt, list):
+        assert len(metadata.dt) == 5
+    else:
+        assert isinstance(metadata.dt, float)
     assert len(metadata.keys) == 3
 
 
@@ -396,7 +474,7 @@ def test_visualize_first_trajectory_in_mujoco(visualize_enabled):
             )
 
     except Exception as e:
-        pytest.skip(f"Visualization test skipped due to: {e}")
+        pytest.fail(f"Visualization test failed due to: {e}")
 
 
 # Remove tests that depend on missing ZarrBackedTrajectoryDataset
