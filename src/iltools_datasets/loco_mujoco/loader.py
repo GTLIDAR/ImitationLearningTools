@@ -95,6 +95,9 @@ class LocoMuJoCoLoader(BaseLoader):
         return env
 
     def _discover_metadata(self) -> DatasetMeta:
+        """
+        TODO: this is useless for now.
+        """
         traj_info: dict[str, Any] = self.env.th.traj.info.to_dict()  # type: ignore
 
         traj_data_keys = [
