@@ -21,13 +21,14 @@ dependencies = [
     "zarr<3",
     "aiohttp",
     "tqdm",
-    "gymnasium",
-    "torch>=2.7",
+    "gymnasium>=1.2",
+    "torch>=2.5",
     "tensordict",
     "mujoco",
     "mediapy",
     "matplotlib",
     "pytest",
+    "dask[complete]",
 ]
 
 [tool.pytest.ini_options]

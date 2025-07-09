@@ -37,11 +37,12 @@ class LocoMuJoCoLoader(BaseLoader):
         **kwargs,
     ):
         """cfg can from conf/ or from Isaaclab dataclass"""
-
         self.cfg = cfg
         self.env_name = env_name
-        self.dataset_dict = cfg.dataset.get(
-            "trajectories", {"default": ["walk"], "amass": [], "lafan1": []}
+        self.dataset_dict = getattr(
+            cfg.dataset,
+            "trajectories",
+            {"default": ["walk"], "amass": [], "lafan1": []},
         )
 
         # self._setup_cache()
@@ -53,7 +54,7 @@ class LocoMuJoCoLoader(BaseLoader):
 
         # Store original frequency info
         self.original_freq = self.env.th.traj.info.frequency
-        self.effective_freq = self.cfg.get("control_freq", self.original_freq)
+        self.effective_freq = getattr(self.cfg, "control_freq", self.original_freq)
 
         self._metadata = self._discover_metadata()
 
@@ -85,7 +86,7 @@ class LocoMuJoCoLoader(BaseLoader):
             default_dataset_conf=default_conf,  # type: ignore
             lafan1_dataset_conf=lafan1_conf,  # type: ignore
             amass_dataset_conf=amass_conf,  # type: ignore
-            n_substeps=self.cfg.get("n_substeps", 20),
+            n_substeps=getattr(self.cfg, "n_substeps", 20),
         )
 
         self.num_traj = len(env.th.traj.data.split_points) - 1  # type: ignore

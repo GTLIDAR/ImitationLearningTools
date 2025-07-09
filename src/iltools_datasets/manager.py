@@ -316,27 +316,11 @@ class TrajectoryDatasetManager:
         # Save using the loader's save method
         loader.save(zarr_path)
 
-        # # Create metadata file
-        # self._create_metadata_file(loader, cfg)
-
-    # def _create_metadata_file(self, loader: LoaderType, cfg: Any) -> None:
-    #     """Create metadata.json file."""
-    #     metadata = {
-    #         "window_size": getattr(cfg, "window_size", 64),
-    #         "control_freq": self._get_control_freq(cfg),
-    #         "desired_horizon_steps": self._get_desired_horizon_steps(cfg),
-    #         "loader_type": type(loader).__name__,
-    #         "num_trajectories": len(loader),
-    #     }
-
-    #     meta_file = os.path.join(self.dataset_path, "metadata.json")
-    #     with open(meta_file, "w") as f:
-    #         json.dump(metadata, f, indent=2)
-
     def _get_loader(
         self, loader_type: str, loader_kwargs: dict[str, Any]
     ) -> LoaderType:
         """Get the appropriate loader based on type."""
+        loader_kwargs.update({"cfg": self.cfg})
         if loader_type == "loco_mujoco":
             return LocoMuJoCoLoader(**loader_kwargs)
         elif loader_type == "amass":
