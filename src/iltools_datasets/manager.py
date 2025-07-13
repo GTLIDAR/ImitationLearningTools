@@ -189,6 +189,7 @@ class TrajectoryDatasetManager:
                 - raw_qpos: Raw qpos data (num_envs, qpos_dim)
                 - raw_qvel: Raw qvel data (num_envs, qvel_dim) if available
         """
+
         # Get current step indices for all environments
         current_steps = list(range(self.num_envs))
 

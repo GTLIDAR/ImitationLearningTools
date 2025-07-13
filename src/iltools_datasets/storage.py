@@ -1,9 +1,7 @@
 from typing import Optional
 
-import dask.array as da
 import numpy as np
 import zarr
-from dask.distributed import Client, wait
 from omegaconf import DictConfig
 
 from iltools_datasets.base_loader import BaseDataset
@@ -17,20 +15,23 @@ class VectorizedTrajectoryDataset(BaseDataset):
     """
 
     def __init__(self, zarr_path: str, num_envs: int, cfg: DictConfig, **kwargs):
-        self.dask_client = Client()
         self.zarr_dataset = zarr.open_group(zarr_path, mode="r")
         self.num_envs = num_envs
         self.cfg = cfg
         self.window_size = cfg.window_size
-        self.all_keys = []
 
-        # suppose we have num_envs trajectories which are specified by cfg
-        self.shuttle = self.prepare_shuttle(num_envs)
+        self.buffer_size = getattr(cfg, "buffer_size", 128)
 
-        # TODO: add customization
-        self.shuttle_pt = [0] * num_envs
-
-        self.env_plan = self._build_env_plan()
+        self.env_traj_ids = [-1] * self.num_envs
+        self.env_steps = [0] * self.num_envs
+        self.window_starts = [0] * self.num_envs
+        self.buffers = [{} for _ in range(self.num_envs)]
+        self.handlers = {}
+        self.traj_lengths = [
+            self.zarr_dataset[traj]["qpos"].shape[0]
+            for traj in self.available_trajectories
+        ]
+        self.all_keys = list(self.zarr_dataset[self.available_trajectories[0]].keys())
 
     @property
     def available_dataset_sources(self) -> list[str]:
@@ -65,93 +66,61 @@ class VectorizedTrajectoryDataset(BaseDataset):
             for trajectory in self.available_trajectories_in(dataset_source, motion)
         ]
 
-    def prepare_shuttle(self, num_envs: int) -> dict[str, list[da.Array]]:
-        """Prepare shuttle for fetching trajectories.
-
-        Returns a dictionary of lists of trajectories, where the keys are the dataset sources
-        and the values are the trajectories.
-        """
-        shuttle: dict[str, list[da.Array]] = {}
-        typical_trajectory = self.zarr_dataset[self.available_trajectories[0]]
-        assert isinstance(typical_trajectory, zarr.Group)
-        self.all_keys = sorted(typical_trajectory.keys())
-        for key in typical_trajectory.keys():
-            shuttle[key] = []
-
-            # initialize with the first trajectory
-            for _ in range(num_envs):
-                data_path = self.available_trajectories[0] + "/" + key
-                shuttle[key].append(da.from_zarr(self.zarr_dataset[data_path]))
-
-        return shuttle
-
-    def prepare_shuttle_pt(self, num_envs: int) -> list[int]:
-        """Prepare shuttle pointer for fetching trajectories."""
-        return [0] * num_envs
-
-    def update_shuttle_pt(self, env_to_traj: dict[int, int]):
-        """Update shuttle pointer for fetching trajectories."""
-        for env_id, idx in env_to_traj.items():
-            self.shuttle_pt[env_id] = idx
-
-    def update_shuttle(self, env_to_traj: dict[int, int]):
-        """Update shuttle for fetching trajectories."""
-        for key in self.shuttle.keys():
-            for env_id, traj_id in env_to_traj.items():
-                self.shuttle[key][env_id] = da.from_zarr(
-                    self.zarr_dataset[self.available_trajectories[traj_id] + "/" + key]
-                )
-
-    def _build_env_plan(self):
-        """Build slice for fetching trajectories. For example,
-        env_plan = [
-            (0, 10),  # env-0  ←  traj_0[10]
-            (1, 10),  # env-1  ←  traj_1[35 000]
-            (2, 10),  # env-2  ←  traj_2[1 234]
-            (3, 10),
-        ]  # env-3  ←  traj_3[42]
-        """
-        return [(env_id, self.shuttle_pt[env_id]) for env_id in range(self.num_envs)]
-
-    def _update_env_plan(self, env_to_step: dict[int, int]):
-        """Update env plan for fetching trajectories."""
-        for env_id, step in env_to_step.items():
-            self.env_plan[env_id] = (self.env_plan[env_id][0], step)
-
     def update_references(
         self,
         env_to_traj: Optional[dict[int, int]] = None,
         env_to_step: Optional[dict[int, int]] = None,
     ):
         if env_to_traj is not None:
-            self.update_shuttle(env_to_traj)
+            for env_id, traj_id in env_to_traj.items():
+                if self.env_traj_ids[env_id] != traj_id:
+                    self.env_traj_ids[env_id] = traj_id
+                    self.buffers[env_id] = {}
+                    self.window_starts[env_id] = 0
         if env_to_step is not None:
-            self.update_shuttle_pt(env_to_step)
-            self._update_env_plan(env_to_step)
-
-    def _maybe_prefetch(self, key: str):
-        """Prefetch data if the number of environments is greater than the number of workers."""
-        slices = [
-            self.shuttle[key][env_id][step + 1][None, :]
-            for env_id, step in self.env_plan
-        ]
-        batch_da = da.stack(slices, axis=0)
-        batch_np = self.dask_client.persist(batch_da)
-        wait(batch_np)
+            for env_id, step in env_to_step.items():
+                self.env_steps[env_id] = step
 
     def fetch(self, idx: list[int], key: Optional[str] = None) -> np.ndarray:
-        # TODO: return all the data in the slice if key is None
         assert key is not None
         assert len(idx) == self.num_envs
 
-        slices = [self.shuttle[key][env_id][step] for env_id, step in self.env_plan]
-        batch_da = da.stack(slices, axis=0)
-        batch_np = batch_da.persist()
+        data_list = []
+        for env_id in range(self.num_envs):
+            traj_id = self.env_traj_ids[env_id]
+            if traj_id == -1:
+                raise ValueError(f"No trajectory assigned to env {env_id}")
+            step = self.env_steps[env_id]
 
-        # wait for the current batch to be computed
-        wait(batch_np)
+            if traj_id not in self.handlers:
+                self.handlers[traj_id] = {}
+            if key not in self.handlers[traj_id]:
+                traj_path = self.available_trajectories[traj_id]
+                self.handlers[traj_id][key] = self.zarr_dataset[traj_path][key]
+            arr = self.handlers[traj_id][key]
 
-        # prefetch the next step
-        # self._maybe_prefetch(key)
+            traj_length = self.traj_lengths[traj_id]
+            if step >= traj_length:
+                raise IndexError(
+                    f"Step {step} >= traj length {traj_length} for env {env_id}"
+                )
 
-        return np.array(batch_np.compute())
+            window_start = self.window_starts[env_id]
+            buffer = self.buffers[env_id].get(key, None)
+            buffer_len = len(buffer) if buffer is not None else 0
+
+            if buffer is None or not (window_start <= step < window_start + buffer_len):
+                new_start = max(0, step - self.buffer_size // 2)
+                new_end = min(new_start + self.buffer_size, traj_length)
+                if step < new_start or step >= new_end:
+                    raise IndexError(
+                        f"Cannot access step {step} in traj length {traj_length}"
+                    )
+                buffer_data = arr[new_start:new_end]
+                self.buffers[env_id][key] = buffer_data
+                self.window_starts[env_id] = new_start
+
+            local_idx = step - self.window_starts[env_id]
+            data_list.append(self.buffers[env_id][key][local_idx])
+
+        return np.stack(data_list, axis=0)

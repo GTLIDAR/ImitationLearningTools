@@ -248,6 +248,7 @@ def test_manager_basic_functionality(tmp_path, basic_cfg):
     try:
         device = torch.device("cpu")
         manager = TrajectoryDatasetManager(cfg=test_cfg, num_envs=2, device=device)
+        manager.reset_trajectories()
         data = manager.get_reference_data()
         print(data.keys())
         for key in [
@@ -290,6 +291,9 @@ def test_manager_comprehensive(tmp_path, basic_cfg):
     test_cfg = DictConfig(
         {
             "dataset_path": str(tmp_path),
+            "dataset": {
+                "trajectories": {"default": ["walk"], "amass": [], "lafan1": []}
+            },
             "loader_type": "loco_mujoco",
             "loader_kwargs": {
                 "env_name": "UnitreeG1",
@@ -306,7 +310,8 @@ def test_manager_comprehensive(tmp_path, basic_cfg):
 
     try:
         device = torch.device("cuda:0")
-        manager = TrajectoryDatasetManager(cfg=test_cfg, num_envs=10, device=device)
+        manager = TrajectoryDatasetManager(cfg=test_cfg, num_envs=4096, device=device)
+        manager.reset_trajectories()
         step_0_data = manager.get_reference_data()
 
         for _ in range(10):
