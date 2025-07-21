@@ -1,5 +1,6 @@
 import json
 import os
+import copy
 from typing import Any, List, Optional, Tuple, Union
 
 import torch
@@ -303,6 +304,7 @@ class TrajectoryDatasetManager:
         """Create Zarr dataset from loader if it doesn't exist."""
         loader_type = getattr(cfg, "loader_type", None)
         loader_kwargs = getattr(cfg, "loader_kwargs", None)
+        loader_kwargs = copy.deepcopy(loader_kwargs)
 
         if loader_type is None or loader_kwargs is None:
             raise RuntimeError(
