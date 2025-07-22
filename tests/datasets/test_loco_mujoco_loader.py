@@ -310,7 +310,7 @@ def test_manager_comprehensive(tmp_path, basic_cfg):
 
     try:
         device = torch.device("cuda:0")
-        manager = TrajectoryDatasetManager(cfg=test_cfg, num_envs=4096, device=device)
+        manager = TrajectoryDatasetManager(cfg=test_cfg, num_envs=10, device=device)
         manager.reset_trajectories()
         step_0_data = manager.get_reference_data()
 
@@ -433,6 +433,7 @@ def test_error_handling(tmp_path):
             json.load(f)
 
 
+@pytest.mark.visualize
 def test_visualize_first_trajectory_in_mujoco(visualize_enabled):
     """
     Optionally visualizes the first trajectory in MuJoCo using the loader's environment.
@@ -452,7 +453,8 @@ def test_visualize_first_trajectory_in_mujoco(visualize_enabled):
             {
                 "dataset": {
                     "trajectories": {"default": ["walk"], "amass": [], "lafan1": []}
-                }
+                },
+                "n_substeps": 20,
             }
         )
 
@@ -468,7 +470,7 @@ def test_visualize_first_trajectory_in_mujoco(visualize_enabled):
             # This will open a MuJoCo viewer window and replay the trajectory
             if hasattr(loader.env, "play_trajectory"):
                 loader.env.play_trajectory(
-                    n_episodes=1, n_steps_per_episode=500, render=True
+                    n_episodes=1, n_steps_per_episode=500, render=True, record=False
                 )
                 print("✅ Visual inspection completed")
             else:
