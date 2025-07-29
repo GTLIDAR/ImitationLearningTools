@@ -306,6 +306,11 @@ class TrajectoryDatasetManager:
         loader_kwargs = getattr(cfg, "loader_kwargs", None)
         loader_kwargs = copy.deepcopy(loader_kwargs)
 
+        print(
+            "[TrajectoryDatasetManager] Creating Zarr dataset with keyword arguments: ",
+            loader_kwargs,
+        )
+
         if loader_type is None or loader_kwargs is None:
             raise RuntimeError(
                 "Zarr dataset not found and loader_type/loader_kwargs not provided in config."

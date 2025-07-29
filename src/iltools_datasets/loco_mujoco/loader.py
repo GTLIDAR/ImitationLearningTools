@@ -37,13 +37,13 @@ class LocoMuJoCoLoader(BaseLoader):
         **kwargs,
     ):
         """cfg can from conf/ or from Isaaclab dataclass"""
+        print("[LocoMuJoCoLoader] Initializing LocoMuJoCoLoader")
         self.cfg = cfg
         self.env_name = env_name
-        self.dataset_dict = getattr(
-            cfg.dataset,
-            "trajectories",
-            {"default": ["walk"], "amass": [], "lafan1": []},
+        self.dataset_dict = cfg.dataset.get(
+            "trajectories", {"default": ["walk"], "amass": [], "lafan1": []}
         )
+        print("[LocoMuJoCoLoader] Dataset dictionary:", self.dataset_dict)
 
         # self._setup_cache()
 
