@@ -29,6 +29,7 @@ dependencies = [
     "matplotlib",
     "pytest",
     "dask[complete]",
+    "loco-mujoco @ git+https://github.com/robfiras/loco-mujoco.git",
 ]
 
 [tool.pytest.ini_options]
