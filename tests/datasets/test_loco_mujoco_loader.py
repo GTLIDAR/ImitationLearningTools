@@ -12,6 +12,7 @@ from iltools_datasets.storage import VectorizedTrajectoryDataset
 from iltools_datasets.manager import TrajectoryDatasetManager
 from iltools_core.metadata_schema import DatasetMeta
 from iltools_core.trajectory import Trajectory
+from loco_mujoco.core import ObservationType
 
 
 @pytest.fixture
@@ -452,13 +453,211 @@ def test_visualize_first_trajectory_in_mujoco(visualize_enabled):
         basic_cfg = DictConfig(
             {
                 "dataset": {
-                    "trajectories": {"default": ["walk"], "amass": [], "lafan1": []}
+                    "trajectories": {
+                        "default": [
+                            "walkturn",
+                            "balance",
+                            "highjump",
+                            "highjump2",
+                            "highknee",
+                            "jumpturn",
+                            "onehopforward",
+                            "onestepleft",
+                            "onestepright",
+                            "onesteplong",
+                            "onestepside1",
+                            "onestepside2",
+                            "random_walk",
+                            "run",
+                            "squat",
+                            "stepinplace1",
+                            "stepinplace2",
+                            "stepinplace3",
+                            "walk",
+                        ],
+                        "amass": [],
+                        "lafan1": [
+                            "dance1_subject1",
+                            "dance1_subject2",
+                            "dance1_subject3",
+                            "dance2_subject1",
+                            "dance2_subject2",
+                            "dance2_subject3",
+                            "fallAndGetUp1_subject1",
+                            "fallAndGetUp1_subject4",
+                            "fallAndGetUp1_subject5",
+                            "fallAndGetUp2_subject2",
+                            "fallAndGetUp2_subject3",
+                            "fallAndGetUp3_subject1",
+                            "fight1_subject2",
+                            "fight1_subject3",
+                            "fight1_subject5",
+                            "fightAndSports1_subject1",
+                            "fightAndSports1_subject4",
+                            "jumps1_subject1",
+                            "jumps1_subject2",
+                            "jumps1_subject5",
+                            "run1_subject2",
+                            "run1_subject5",
+                            "run2_subject1",
+                            "run2_subject4",
+                            "sprint1_subject2",
+                            "sprint1_subject4",
+                            "walk1_subject1",
+                            "walk1_subject2",
+                            "walk1_subject5",
+                            "walk2_subject1",
+                            "walk2_subject3",
+                            "walk2_subject4",
+                            "walk3_subject1",
+                            "walk3_subject2",
+                            "walk3_subject3",
+                            "walk3_subject4",
+                            "walk3_subject5",
+                            "walk4_subject1",
+                        ],
+                    }
                 },
                 "n_substeps": 20,
             }
         )
 
-        loader = LocoMuJoCoLoader(env_name="UnitreeG1", cfg=basic_cfg)
+        observation_spec = [  # ------------- JOINT POS -------------
+            ObservationType.FreeJointPos("q_root", xml_name="root"),
+            ObservationType.JointPos(
+                "q_left_hip_pitch_joint", xml_name="left_hip_pitch_joint"
+            ),
+            ObservationType.JointPos(
+                "q_left_hip_roll_joint", xml_name="left_hip_roll_joint"
+            ),
+            ObservationType.JointPos(
+                "q_left_hip_yaw_joint", xml_name="left_hip_yaw_joint"
+            ),
+            ObservationType.JointPos("q_left_knee_joint", xml_name="left_knee_joint"),
+            ObservationType.JointPos(
+                "q_left_ankle_pitch_joint", xml_name="left_ankle_pitch_joint"
+            ),
+            ObservationType.JointPos(
+                "q_left_ankle_roll_joint", xml_name="left_ankle_roll_joint"
+            ),
+            ObservationType.JointPos(
+                "q_right_hip_pitch_joint", xml_name="right_hip_pitch_joint"
+            ),
+            ObservationType.JointPos(
+                "q_right_hip_roll_joint", xml_name="right_hip_roll_joint"
+            ),
+            ObservationType.JointPos(
+                "q_right_hip_yaw_joint", xml_name="right_hip_yaw_joint"
+            ),
+            ObservationType.JointPos("q_right_knee_joint", xml_name="right_knee_joint"),
+            ObservationType.JointPos(
+                "q_right_ankle_pitch_joint", xml_name="right_ankle_pitch_joint"
+            ),
+            ObservationType.JointPos(
+                "q_right_ankle_roll_joint", xml_name="right_ankle_roll_joint"
+            ),
+            ObservationType.JointPos("q_waist_yaw_joint", xml_name="waist_yaw_joint"),
+            ObservationType.JointPos(
+                "q_left_shoulder_pitch_joint", xml_name="left_shoulder_pitch_joint"
+            ),
+            ObservationType.JointPos(
+                "q_left_shoulder_roll_joint", xml_name="left_shoulder_roll_joint"
+            ),
+            ObservationType.JointPos(
+                "q_left_shoulder_yaw_joint", xml_name="left_shoulder_yaw_joint"
+            ),
+            ObservationType.JointPos("q_left_elbow_joint", xml_name="left_elbow_joint"),
+            ObservationType.JointPos(
+                "q_left_wrist_roll_joint", xml_name="left_wrist_roll_joint"
+            ),
+            ObservationType.JointPos(
+                "q_right_shoulder_pitch_joint", xml_name="right_shoulder_pitch_joint"
+            ),
+            ObservationType.JointPos(
+                "q_right_shoulder_roll_joint", xml_name="right_shoulder_roll_joint"
+            ),
+            ObservationType.JointPos(
+                "q_right_shoulder_yaw_joint", xml_name="right_shoulder_yaw_joint"
+            ),
+            ObservationType.JointPos(
+                "q_right_elbow_joint", xml_name="right_elbow_joint"
+            ),
+            ObservationType.JointPos(
+                "q_right_wrist_roll_joint", xml_name="right_wrist_roll_joint"
+            ),
+            # ------------- JOINT VEL -------------
+            ObservationType.FreeJointVel("dq_root", xml_name="root"),
+            ObservationType.JointVel(
+                "dq_left_hip_pitch_joint", xml_name="left_hip_pitch_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_left_hip_roll_joint", xml_name="left_hip_roll_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_left_hip_yaw_joint", xml_name="left_hip_yaw_joint"
+            ),
+            ObservationType.JointVel("dq_left_knee_joint", xml_name="left_knee_joint"),
+            ObservationType.JointVel(
+                "dq_left_ankle_pitch_joint", xml_name="left_ankle_pitch_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_left_ankle_roll_joint", xml_name="left_ankle_roll_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_right_hip_pitch_joint", xml_name="right_hip_pitch_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_right_hip_roll_joint", xml_name="right_hip_roll_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_right_hip_yaw_joint", xml_name="right_hip_yaw_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_right_knee_joint", xml_name="right_knee_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_right_ankle_pitch_joint", xml_name="right_ankle_pitch_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_right_ankle_roll_joint", xml_name="right_ankle_roll_joint"
+            ),
+            ObservationType.JointVel("dq_waist_yaw_joint", xml_name="waist_yaw_joint"),
+            ObservationType.JointVel(
+                "dq_left_shoulder_pitch_joint", xml_name="left_shoulder_pitch_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_left_shoulder_roll_joint", xml_name="left_shoulder_roll_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_left_shoulder_yaw_joint", xml_name="left_shoulder_yaw_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_left_elbow_joint", xml_name="left_elbow_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_left_wrist_roll_joint", xml_name="left_wrist_roll_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_right_shoulder_pitch_joint", xml_name="right_shoulder_pitch_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_right_shoulder_roll_joint", xml_name="right_shoulder_roll_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_right_shoulder_yaw_joint", xml_name="right_shoulder_yaw_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_right_elbow_joint", xml_name="right_elbow_joint"
+            ),
+            ObservationType.JointVel(
+                "dq_right_wrist_roll_joint", xml_name="right_wrist_roll_joint"
+            ),
+        ]
+        loader = LocoMuJoCoLoader(
+            env_name="UnitreeG1",
+            cfg=basic_cfg,
+            observation_spec=observation_spec,
+        )
 
         # Always test basic functionality
         assert len(loader) > 0, "Loader should have at least one trajectory"
@@ -470,7 +669,7 @@ def test_visualize_first_trajectory_in_mujoco(visualize_enabled):
             # This will open a MuJoCo viewer window and replay the trajectory
             if hasattr(loader.env, "play_trajectory"):
                 loader.env.play_trajectory(
-                    n_episodes=1, n_steps_per_episode=500, render=True, record=False
+                    n_episodes=55, n_steps_per_episode=1000, render=True, record=True
                 )
                 print("✅ Visual inspection completed")
             else:

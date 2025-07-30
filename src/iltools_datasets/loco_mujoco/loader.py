@@ -47,7 +47,7 @@ class LocoMuJoCoLoader(BaseLoader):
 
         # self._setup_cache()
 
-        self.env: LocoEnv = self._load_env()
+        self.env: LocoEnv = self._load_env(**kwargs)
         assert hasattr(self.env, "th") and isinstance(self.env.th, TrajectoryHandler), (
             "TrajectoryHandler not found in env"
         )
@@ -64,7 +64,7 @@ class LocoMuJoCoLoader(BaseLoader):
             os.makedirs(cache_path)
         os.environ["LOCO_MUJOCO_CACHE"] = cache_path
 
-    def _load_env(self):
+    def _load_env(self, **kwargs):
         # Only create confs if the list is non-empty, otherwise set to None
         default_conf = (
             DefaultDatasetConf(self.dataset_dict["default"])
@@ -87,6 +87,7 @@ class LocoMuJoCoLoader(BaseLoader):
             lafan1_dataset_conf=lafan1_conf,  # type: ignore
             amass_dataset_conf=amass_conf,  # type: ignore
             n_substeps=getattr(self.cfg, "n_substeps", 20),
+            **kwargs,
         )
 
         self.num_traj = len(env.th.traj.data.split_points) - 1  # type: ignore
