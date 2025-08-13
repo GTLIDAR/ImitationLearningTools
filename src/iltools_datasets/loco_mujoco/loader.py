@@ -86,7 +86,6 @@ class LocoMuJoCoLoader(BaseLoader):
             default_dataset_conf=default_conf,  # type: ignore
             lafan1_dataset_conf=lafan1_conf,  # type: ignore
             amass_dataset_conf=amass_conf,  # type: ignore
-            n_substeps=getattr(self.cfg, "n_substeps", 20),
             **kwargs,
         )
 
