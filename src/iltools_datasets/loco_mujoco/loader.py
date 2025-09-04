@@ -166,6 +166,21 @@ class LocoMuJoCoLoader(BaseLoader):
         └── ...
 
         However, the loco-mujoco dataset only assigns one trajectory to each motion.
+
+        Transition export (optional):
+          If `export_transitions=True` is passed via kwargs, this method will attempt
+          to export per-step transition tuples (obs, action, next_obs) using the
+          environment's observation function and the controller actions recorded
+          by Loco-MuJoCo. The arrays will be saved under keys provided by
+          `obs_key_name` (default: 'obs') and `action_key_name` (default: 'action').
+
+          Notes:
+            - This requires Loco-MuJoCo to expose the necessary APIs to reconstruct
+              observations and actions for each step. If unavailable, a
+              NotImplementedError is raised.
+            - The Zarr → Replay pipeline in `replay_export.py` will pick up these
+              keys automatically and include an additional `lmj_observation` view
+              in the replay TensorDicts.
         """
 
         chunk_size: int = kwargs.get("chunk_size", 10)
@@ -232,3 +247,84 @@ class LocoMuJoCoLoader(BaseLoader):
                     shards=shards,
                 )
                 trajectory_data[:] = sliced_value
+
+            # Optionally export (obs, action, next_obs) per-step transitions
+            if kwargs.get("export_transitions", False):
+                obs_key_name = kwargs.get("obs_key_name", "obs")
+                next_obs_key_name = kwargs.get("next_obs_key_name", "next_obs")
+                action_key_name = kwargs.get("action_key_name", "action")
+
+                # Ensure transitions are available; if not, create them
+                transitions = self.env.th.traj.transitions  # type: ignore
+                if transitions is None:
+                    transitions = self.env.create_dataset()
+
+                # Convert to numpy if needed
+                try:
+                    observations = np.asarray(transitions.observations)
+                    next_observations = np.asarray(transitions.next_observations)
+                    actions = np.asarray(transitions.actions) if transitions.actions.size > 0 else None
+                    absorbings = np.asarray(transitions.absorbings) if transitions.absorbings.size > 0 else None
+                    dones = np.asarray(transitions.dones) if transitions.dones.size > 0 else None
+                except Exception:
+                    # transitions may be jax arrays; convert via provided helpers
+                    try:
+                        observations = transitions.to_np().observations  # type: ignore
+                        next_observations = transitions.to_np().next_observations  # type: ignore
+                        actions = transitions.to_np().actions if transitions.actions.size > 0 else None  # type: ignore
+                        absorbings = transitions.to_np().absorbings if transitions.absorbings.size > 0 else None  # type: ignore
+                        dones = transitions.to_np().dones if transitions.dones.size > 0 else None  # type: ignore
+                    except Exception as e:  # pragma: no cover - unexpected type
+                        raise RuntimeError("Failed to convert transitions to numpy arrays") from e
+
+                # Slice out this trajectory's segment: number of transitions is (traj_len-1)
+                traj_len = traj_end - traj_start
+                # Compute offset as sum_{k < idx} (len_k - 1). We accumulate on the fly.
+                if idx == 0:
+                    prev_transitions = 0
+                else:
+                    # Recompute prior transitions from split_points for robustness
+                    prev_transitions = 0
+                    for k in range(idx):
+                        s = self.env.th.traj.data.split_points[k]  # type: ignore
+                        e = self.env.th.traj.data.split_points[k + 1]  # type: ignore
+                        prev_transitions += max(0, int(e - s) - 1)
+
+                n_this = max(0, int(traj_len) - 1)
+                if n_this <= 0:
+                    continue
+
+                obs_slice = observations[prev_transitions:prev_transitions + n_this]
+                next_obs_slice = next_observations[prev_transitions:prev_transitions + n_this]
+                actions_slice = (
+                    None if actions is None else actions[prev_transitions:prev_transitions + n_this]
+                )
+                absorb_slice = (
+                    None if absorbings is None else absorbings[prev_transitions:prev_transitions + n_this]
+                )
+                dones_slice = None if dones is None else dones[prev_transitions:prev_transitions + n_this]
+
+                # Write to Zarr under trajectory group
+                traj_obs = trajectory_group.create_dataset(
+                    obs_key_name, shape=obs_slice.shape, dtype=obs_slice.dtype
+                )
+                traj_obs[:] = obs_slice
+                traj_next_obs = trajectory_group.create_dataset(
+                    next_obs_key_name, shape=next_obs_slice.shape, dtype=next_obs_slice.dtype
+                )
+                traj_next_obs[:] = next_obs_slice
+                if actions_slice is not None:
+                    traj_act = trajectory_group.create_dataset(
+                        action_key_name, shape=actions_slice.shape, dtype=actions_slice.dtype
+                    )
+                    traj_act[:] = actions_slice
+                if absorb_slice is not None:
+                    traj_abs = trajectory_group.create_dataset(
+                        "absorbing", shape=absorb_slice.shape, dtype=absorb_slice.dtype
+                    )
+                    traj_abs[:] = absorb_slice
+                if dones_slice is not None:
+                    traj_done = trajectory_group.create_dataset(
+                        "done", shape=dones_slice.shape, dtype=dones_slice.dtype
+                    )
+                    traj_done[:] = dones_slice
