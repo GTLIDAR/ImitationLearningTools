@@ -94,7 +94,7 @@ def build_replay_from_zarr(
         first_key = next((k for k in obs_keys if k in traj_group), None)
         if first_key is None:
             continue
-        T = int(traj_group[first_key].shape[0])
+        T = int(np.asarray(traj_group[first_key]).shape[0])
         if T >= 2:
             total_T += T - 1
 
@@ -115,7 +115,7 @@ def build_replay_from_zarr(
                 )
             else:
                 continue
-        T = int(traj_group[first_key].shape[0])
+        T = int(np.asarray(traj_group[first_key]).shape[0])
         if T < 2:
             continue
         n_this = T - 1

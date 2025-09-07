@@ -1,6 +1,3 @@
-import os
-import sys
-
 import pytest
 import torch
 
@@ -105,3 +102,75 @@ def test_expert_replay_manager_end_to_end(tmp_path):
     mgr.set_uniform_sampler(batch_size=5, without_replacement=True)
     uni = mgr.buffer.sample()
     assert uni.batch_size[0] == 5
+
+
+def test_uniform_sampler_respects_assignment(tmp_path):
+    # Build 3 segments across two tasks
+    # tasks: 0 has traj 0 (T=3) and traj 1 (T=4); task 1 has traj 0 (T=2)
+    tasks = {
+        0: [_mk_traj(0, 0, T=3), _mk_traj(0, 1, T=4)],
+        1: [_mk_traj(1, 0, T=2)],
+    }
+    spec = ExpertReplaySpec(
+        tasks=tasks, scratch_dir=str(tmp_path), device="cpu", sample_batch_size=16
+    )
+    mgr = ExpertReplayManager(spec)
+
+    # Set an assignment that excludes (task=0, traj=1)
+    asg = [EnvAssignment(0, 0, 0), EnvAssignment(1, 0, 0)]
+    mgr.set_assignment(asg)
+
+    # Switch to uniform minibatching but restrict to assigned segments
+    mgr.set_uniform_sampler(
+        batch_size=32, without_replacement=False, respect_assignment=True
+    )
+    batch = mgr.buffer.sample()
+    # All samples should come from either (0,0) or (1,0); never (0,1)
+    obs = batch["observation"]
+    # First column encodes task_id, second encodes traj_id in our synthetic builder
+    tasks_ids = obs[:, 0]
+    traj_ids = obs[:, 1]
+    # Ensure there is no (task=0, traj=1)
+    invalid = (tasks_ids == 0.0) & (traj_ids == 1.0)
+    assert torch.count_nonzero(invalid) == 0
+
+
+def test_update_env_assignment_sequential(tmp_path):
+    # Two tasks, one traj each
+    tasks = {0: [_mk_traj(0, 0, T=3)], 1: [_mk_traj(1, 0, T=3)]}
+    spec = ExpertReplaySpec(tasks=tasks, scratch_dir=str(tmp_path), device="cpu")
+    mgr = ExpertReplayManager(spec)
+    # Start with env0->(0,0)@0, env1->(1,0)@0
+    mgr.set_assignment([EnvAssignment(0, 0, 0), EnvAssignment(1, 0, 0)])
+    b1 = mgr.buffer.sample()
+    o1 = b1["observation"]
+    assert torch.allclose(o1[0], torch.tensor([0.0, 0.0, 0.0]))
+    assert torch.allclose(o1[1], torch.tensor([1.0, 0.0, 0.0]))
+    # Reassign env1 to (0,0) with step=2
+    mgr.update_env_assignment(1, task_id=0, traj_id=0, step=2)
+    b2 = mgr.buffer.sample()
+    o2 = b2["observation"]
+    # env0 advanced to t=1, env1 now reads (0,0)@2
+    assert torch.allclose(o2[0], torch.tensor([0.0, 0.0, 1.0]))
+    assert torch.allclose(o2[1], torch.tensor([0.0, 0.0, 2.0]))
+
+
+def test_update_env_assignment_affects_assigned_uniform(tmp_path):
+    # Three segments: (0,0), (0,1), (1,0) each of length 2
+    tasks = {0: [_mk_traj(0, 0, T=2), _mk_traj(0, 1, T=2)], 1: [_mk_traj(1, 0, T=2)]}
+    spec = ExpertReplaySpec(tasks=tasks, scratch_dir=str(tmp_path), device="cpu")
+    mgr = ExpertReplayManager(spec)
+    # Initial assignment excludes (0,1)
+    mgr.set_assignment([EnvAssignment(0, 0, 0), EnvAssignment(1, 0, 0)])
+    mgr.set_uniform_sampler(
+        batch_size=4, without_replacement=True, respect_assignment=True
+    )
+    batch = mgr.buffer.sample()
+    obs = batch["observation"]
+    assert torch.count_nonzero((obs[:, 0] == 0.0) & (obs[:, 1] == 1.0)) == 0
+    # Now reassign env0 to (0,1) and ensure minibatch draws only from (0,1) and (1,0)
+    mgr.update_env_assignment(0, task_id=0, traj_id=1, step=0)
+    # New allowed set has (0,1) and (1,0) totaling 4 indices; sample full epoch
+    batch2 = mgr.buffer.sample()
+    obs2 = batch2["observation"]
+    assert torch.count_nonzero((obs2[:, 0] == 0.0) & (obs2[:, 1] == 0.0)) == 0
