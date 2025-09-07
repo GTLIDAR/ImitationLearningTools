@@ -3,7 +3,6 @@
 
 Scaffold for a modular imitation learning toolkit with dataset loaders, retargeting, and CLI utilities.
 
-This is **only a skeleton**—fill in each module with real logic as you develop.
 
 ## Installation
 
@@ -69,6 +68,8 @@ Dataset/
 │   └── ...
 └── ...
 ```
+
+E.g. We currently support ```loco-mujoco``` dataset with various motions such as ```default-walk``` with ```1``` trajectory. 
 
 ## Usage
 
