@@ -10,7 +10,7 @@ We recommend using the `conda-forge` channel for managing dependencies. For a fa
 
 1.  **Create and activate a conda environment:**
     ```bash
-    mamba create -n iltools python=3.10 -c conda-forge
+    mamba create -n iltools python=3.11 -c conda-forge
     conda activate iltools
     ```
 
@@ -20,7 +20,10 @@ We recommend using the `conda-forge` channel for managing dependencies. For a fa
     ```
 
 3.  **Install the project:**
-    From the root of this repository, run:
+
+    First, install [```loco-mujoco```](https://github.com/robfiras/loco-mujoco.git).
+
+    Then from the root of this repository, run:
     ```bash
     uv pip install -e .
     ```

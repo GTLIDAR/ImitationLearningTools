@@ -5,28 +5,38 @@ from typing import Tuple
 import numpy as np
 import pytest
 import zarr
+from zarr.storage import LocalStore
 from omegaconf import OmegaConf
 
 from iltools_datasets.manager import TrajectoryDatasetManager
 
 try:
     import torch
+
     TORCH_AVAILABLE = True
 except Exception:
     TORCH_AVAILABLE = False
     import pytest
+
     pytest.skip("PyTorch not available", allow_module_level=True)
 
 
-def _make_traj(root, dataset_source: str, motion: str, traj_name: str, length: int, ref_joint_count: int) -> None:
+def _make_traj(
+    root,
+    dataset_source: str,
+    motion: str,
+    traj_name: str,
+    length: int,
+    ref_joint_count: int,
+) -> None:
     ds_g = root.require_group(dataset_source)
     mot_g = ds_g.require_group(motion)
     traj_g = mot_g.create_group(traj_name)
 
     qpos_dim = 7 + ref_joint_count
     qvel_dim = 6 + ref_joint_count
-    qpos = traj_g.zeros("qpos", shape=(length, qpos_dim), dtype=np.float32)
-    qvel = traj_g.zeros("qvel", shape=(length, qvel_dim), dtype=np.float32)
+    qpos = traj_g.zeros(name="qpos", shape=(length, qpos_dim), dtype=np.float32)
+    qvel = traj_g.zeros(name="qvel", shape=(length, qvel_dim), dtype=np.float32)
     # Fill root pos/quat and joint data with patterns
     for t in range(length):
         qpos[t, :3] = [t * 0.1, 0.0, 0.5]
@@ -39,11 +49,13 @@ def _make_traj(root, dataset_source: str, motion: str, traj_name: str, length: i
 
 def _build_zarr_dataset(tmp_dir: str, ref_joint_count: int = 5) -> str:
     zarr_path = os.path.join(tmp_dir, "trajectories.zarr")
-    store = zarr.DirectoryStore(zarr_path)
+    store = LocalStore(zarr_path)
     root = zarr.group(store=store, overwrite=True)
 
     _make_traj(root, "ds1", "walk", "traj0", length=20, ref_joint_count=ref_joint_count)
-    _make_traj(root, "ds1", "dance", "traj0", length=15, ref_joint_count=ref_joint_count)
+    _make_traj(
+        root, "ds1", "dance", "traj0", length=15, ref_joint_count=ref_joint_count
+    )
     return zarr_path
 
 

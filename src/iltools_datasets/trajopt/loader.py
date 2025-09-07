@@ -67,10 +67,11 @@ class TrajoptLoader(BaseLoader):
         Saves the dataset to a directory using zarr format.
         """
         import zarr
+        from zarr.storage import LocalStore
         import os
 
         # Create zarr store
-        store = zarr.DirectoryStore(path)
+        store = LocalStore(path)
         root = zarr.group(store=store, overwrite=True)
 
         # Create dataset group
@@ -83,13 +84,25 @@ class TrajoptLoader(BaseLoader):
             traj_group = motion_group.create_group(f"traj{i}")
 
             # Save trajectory data
-            traj_group.create_dataset("qpos", data=data["qpos"], dtype=np.float32)
-            traj_group.create_dataset("qvel", data=data["qvel"], dtype=np.float32)
-            traj_group.create_dataset("actions", data=data["actions"], dtype=np.float32)
+            qpos_ds = traj_group.create_dataset(
+                "qpos", shape=data["qpos"].shape, dtype=np.float32
+            )
+            qpos_ds[:] = data["qpos"]
+            qvel_ds = traj_group.create_dataset(
+                "qvel", shape=data["qvel"].shape, dtype=np.float32
+            )
+            qvel_ds[:] = data["qvel"]
+            actions_ds = traj_group.create_dataset(
+                "actions", shape=data["actions"].shape, dtype=np.float32
+            )
+            actions_ds[:] = data["actions"]
 
             # Save metadata
             if "dt" in data:
-                traj_group.create_dataset("dt", data=data["dt"], dtype=np.float32)
+                dt_ds = traj_group.create_dataset(
+                    "dt", shape=data["dt"].shape, dtype=np.float32
+                )
+                dt_ds[:] = data["dt"]
 
         # Save metadata.json
         metadata_path = os.path.join(os.path.dirname(path), "metadata.json")

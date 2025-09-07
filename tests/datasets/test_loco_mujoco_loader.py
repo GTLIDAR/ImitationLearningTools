@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import os
 import zarr
-from zarr import storage
+from zarr.storage import LocalStore
 import mujoco
 from typing import Optional
 from omegaconf import DictConfig
@@ -93,7 +93,7 @@ def test_vectorized_dataset_init(tmp_path, minimal_loader, basic_cfg):
     zarr_path = out_dir / "trajectories.zarr"
     os.makedirs(out_dir, exist_ok=True)
 
-    store = storage.DirectoryStore(str(zarr_path))
+    store = LocalStore(str(zarr_path))
     root = zarr.group(store=store, overwrite=True)
 
     # Create the expected loco_mujoco group structure
@@ -102,27 +102,27 @@ def test_vectorized_dataset_init(tmp_path, minimal_loader, basic_cfg):
     traj_group = default_group.create_group("trajectory_0")
 
     # Add minimal data
-    traj_group.create_dataset(
+    qpos_ds = traj_group.create_dataset(
         "qpos",
         shape=(10, 3),
         dtype=np.float32,
         chunks=(10, 3),
-        data=np.ones((10, 3), dtype=np.float32),
     )
-    traj_group.create_dataset(
+    qpos_ds[:] = np.ones((10, 3), dtype=np.float32)
+    qvel_ds = traj_group.create_dataset(
         "qvel",
         shape=(10, 3),
         dtype=np.float32,
         chunks=(10, 3),
-        data=np.ones((10, 3), dtype=np.float32),
     )
-    traj_group.create_dataset(
+    qvel_ds[:] = np.ones((10, 3), dtype=np.float32)
+    actions_ds = traj_group.create_dataset(
         "actions",
         shape=(10, 3),
         dtype=np.float32,
         chunks=(10, 3),
-        data=np.ones((10, 3), dtype=np.float32),
     )
+    actions_ds[:] = np.ones((10, 3), dtype=np.float32)
     traj_group.attrs["dt"] = 0.05
     traj_group.attrs["trajectory_length"] = 10
     traj_group.attrs["trajectory_id"] = 0
@@ -192,7 +192,7 @@ def test_manager_basic_functionality(tmp_path, basic_cfg):
     """Test TrajectoryDatasetManager basic functionality."""
     # Create a minimal zarr dataset for testing using the correct structure
     zarr_path = tmp_path / "trajectories.zarr"
-    store = storage.DirectoryStore(str(zarr_path))
+    store = LocalStore(str(zarr_path))
     root = zarr.group(store=store, overwrite=True)
 
     # Create the expected loco_mujoco dataset structure

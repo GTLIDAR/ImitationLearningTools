@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "iltools"
-version = "0.2.0"
+version = "0.3.0"
 authors = [{ name = "Feiyang Wu", email = "feiyang.wu@gatech.edu" }]
 description = "Modular toolkit for robot imitation learning"
 readme = "README.md"
@@ -13,22 +13,19 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "pydantic",
-    "typer",
-    "pinocchio",
     "smplx",
     "rich",
     "hydra-core",
-    "zarr<3",
+    "zarr>3",
     "aiohttp",
     "tqdm",
     "gymnasium>=1.2",
-    "torch>=2.5",
-    "tensordict",
+    "torch",
+    "tensordict>=0.9",
     "mujoco",
     "mediapy",
     "matplotlib",
     "pytest",
-    "dask[complete]",
     "loco-mujoco",
 ]
 

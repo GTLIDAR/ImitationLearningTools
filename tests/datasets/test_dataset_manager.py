@@ -45,8 +45,9 @@ class TestTrajectoryDatasetManager:
         max_traj_length = 200
 
         import zarr
+        from zarr.storage import LocalStore
 
-        store = zarr.DirectoryStore(zarr_path)
+        store = LocalStore(zarr_path)
         root = zarr.group(store=store, overwrite=True)
 
         # Generate varying trajectory lengths
@@ -60,9 +61,11 @@ class TestTrajectoryDatasetManager:
             length = traj_lengths[traj_idx]
             traj_group = motion_group.create_group(f"traj{traj_idx}")
 
-            qpos = traj_group.zeros("qpos", shape=(length, 30), dtype=np.float32)
-            qvel = traj_group.zeros("qvel", shape=(length, 29), dtype=np.float32)
-            actions = traj_group.zeros("actions", shape=(length, 12), dtype=np.float32)
+            qpos = traj_group.zeros(name="qpos", shape=(length, 30), dtype=np.float32)
+            qvel = traj_group.zeros(name="qvel", shape=(length, 29), dtype=np.float32)
+            actions = traj_group.zeros(
+                name="actions", shape=(length, 12), dtype=np.float32
+            )
 
             for t in range(length):
                 # Root position (first 3: x, y, z)

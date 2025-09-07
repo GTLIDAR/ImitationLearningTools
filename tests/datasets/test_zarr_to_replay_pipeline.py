@@ -2,28 +2,32 @@ import os
 import numpy as np
 import pytest
 import zarr
+from zarr.storage import LocalStore
 
 try:
     import torch
     from iltools_datasets.replay_export import build_replay_from_zarr
+
     TORCH_STACK_AVAILABLE = True
 except Exception:
     TORCH_STACK_AVAILABLE = False
 
 
-pytestmark = pytest.mark.skipif(not TORCH_STACK_AVAILABLE, reason="torch/tensordict/torchrl not available")
+pytestmark = pytest.mark.skipif(
+    not TORCH_STACK_AVAILABLE, reason="torch/tensordict/torchrl not available"
+)
 
 
 def _make_small_zarr(path: str):
-    store = zarr.DirectoryStore(path)
+    store = LocalStore(path)
     root = zarr.group(store=store, overwrite=True)
     g = root.create_group("ds1").create_group("walk").create_group("traj0")
     T = 6
     # Simple increasing signal for obs; actions are constant ones
-    qpos = g.zeros("qpos", shape=(T, 3), dtype=np.float32)
+    qpos = g.zeros(name="qpos", shape=(T, 3), dtype=np.float32)
     # Original observation vector from loco-mujoco (for this test, distinct from qpos)
-    obs = g.zeros("obs", shape=(T, 4), dtype=np.float32)
-    action = g.zeros("action", shape=(T, 2), dtype=np.float32)
+    obs = g.zeros(name="obs", shape=(T, 4), dtype=np.float32)
+    action = g.zeros(name="action", shape=(T, 2), dtype=np.float32)
     for t in range(T):
         qpos[t, :] = t
         obs[t, :] = t + 100  # distinguish from qpos

@@ -61,11 +61,11 @@ class VectorizedTrajectoryDataset(BaseDataset):
             group = self.zarr_dataset[traj]
             assert isinstance(group, zarr.Group)
             if self.all_keys is None:
-                self.all_keys = list(group.keys())
+                self.all_keys = sorted(list(group.keys()))
             else:
-                if list(group.keys()) != self.all_keys:
+                if sorted(list(group.keys())) != self.all_keys:
                     raise ValueError(
-                        f"Inconsistent keys across trajectories: {traj} has {list(group.keys())}, expected {self.all_keys}"
+                        f"Inconsistent keys across trajectories: {traj} has {sorted(list(group.keys()))}, expected {self.all_keys}"
                     )
             if "qpos" not in group:
                 raise KeyError(f"Trajectory {traj} missing required key 'qpos'")
@@ -96,7 +96,7 @@ class VectorizedTrajectoryDataset(BaseDataset):
         assert isinstance(dataset_source_group, zarr.Group)
         motion_group = dataset_source_group[motion]
         assert isinstance(motion_group, zarr.Group)
-        return list(motion_group.keys())
+        return sorted(list(motion_group.keys()))
 
     @property
     def available_trajectories(self) -> list[str]:

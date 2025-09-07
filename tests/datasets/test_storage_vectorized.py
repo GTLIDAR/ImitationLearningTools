@@ -4,6 +4,7 @@ from typing import Tuple
 import numpy as np
 import pytest
 import zarr
+from zarr.storage import LocalStore
 from omegaconf import OmegaConf
 
 from iltools_datasets.storage import VectorizedTrajectoryDataset
@@ -11,7 +12,7 @@ from iltools_datasets.storage import VectorizedTrajectoryDataset
 
 def _create_simple_zarr(root_dir: str) -> Tuple[str, list[int]]:
     zarr_path = os.path.join(root_dir, "trajectories.zarr")
-    store = zarr.DirectoryStore(zarr_path)
+    store = LocalStore(zarr_path)
     root = zarr.group(store=store, overwrite=True)
 
     # Structure: ds1/walk/traj0, ds1/walk/traj1
@@ -23,14 +24,14 @@ def _create_simple_zarr(root_dir: str) -> Tuple[str, list[int]]:
 
     for i, L in enumerate(lengths):
         g_traj = g_motion.create_group(f"traj{i}")
-        qpos = g_traj.zeros("qpos", shape=(L, qpos_dim), dtype=np.float32)
-        qvel = g_traj.zeros("qvel", shape=(L, qvel_dim), dtype=np.float32)
+        qpos = g_traj.zeros(name="qpos", shape=(L, qpos_dim), dtype=np.float32)
+        qvel = g_traj.zeros(name="qvel", shape=(L, qvel_dim), dtype=np.float32)
         # also create an action key for potential replay tests
-        g_traj.zeros("action", shape=(L, 3), dtype=np.float32)
+        g_traj.zeros(name="action", shape=(L, 3), dtype=np.float32)
         # Fill with recognizable values: qpos[t, 0] = 100*i + t; qvel[t, 0] = 200*i + t
         for t in range(L):
-            qpos[t, :] = 100 * i + t
-            qvel[t, :] = 200 * i + t
+            qpos[t, 0] = 100 * i + t
+            qvel[t, 0] = 200 * i + t
 
     return zarr_path, lengths
 
