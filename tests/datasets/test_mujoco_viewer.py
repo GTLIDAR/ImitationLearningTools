@@ -35,11 +35,15 @@ def test_mujoco_viewer_basic():
     """
     model = mujoco.MjModel.from_xml_string(xml)
     data = mujoco.MjData(model)
-    with mujoco.viewer.launch(model, data):
-        print(
-            "A MuJoCo viewer window should open with a blue box. Close it to finish the test."
-        )
-        # The context manager blocks until the window is closed
+    viewer = mujoco.viewer.launch(model, data)
+    if viewer is not None:
+        with viewer:
+            print(
+                "A MuJoCo viewer window should open with a blue box. Close it to finish the test."
+            )
+            # The context manager blocks until the window is closed
+    else:
+        print("MuJoCo viewer not available (no display)")
 
 
 @pytest.mark.visual
@@ -61,8 +65,12 @@ def test_mujoco_viewer_pendulum():
     """
     model = mujoco.MjModel.from_xml_string(xml)
     data = mujoco.MjData(model)
-    with mujoco.viewer.launch(model, data):
-        print(
-            "A MuJoCo viewer window should open with an orange pendulum. Close it to finish the test."
-        )
-        # The context manager blocks until the window is closed
+    viewer = mujoco.viewer.launch(model, data)
+    if viewer is not None:
+        with viewer:
+            print(
+                "A MuJoCo viewer window should open with an orange pendulum. Close it to finish the test."
+            )
+            # The context manager blocks until the window is closed
+    else:
+        print("MuJoCo viewer not available (no display)")

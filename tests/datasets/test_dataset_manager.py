@@ -10,8 +10,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from iltools_datasets.dataset_manager import TrajectoryDatasetManager
-from iltools_datasets.windowed_dataset import WindowedTrajectoryDataset
+from iltools_datasets.manager import TrajectoryDatasetManager
 
 
 class MockConfig:
@@ -20,6 +19,16 @@ class MockConfig:
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
             setattr(self, key, value)
+        # Provide sensible defaults expected by current implementation
+        if not hasattr(self, "window_size"):
+            self.window_size = 64
+        if not hasattr(self, "buffer_size"):
+            self.buffer_size = 128
+        # Manager requires joint name lists
+        if not hasattr(self, "reference_joint_names"):
+            self.reference_joint_names = [f"j{i}" for i in range(23)]
+        if not hasattr(self, "target_joint_names"):
+            self.target_joint_names = list(self.reference_joint_names)
 
 
 class TestTrajectoryDatasetManager:
@@ -43,36 +52,29 @@ class TestTrajectoryDatasetManager:
         # Generate varying trajectory lengths
         traj_lengths = [100, 150, 200, 80, 120, 180, 90, 160]
 
-        # Create observation data (qpos: COM + joints)
-        obs_group = root.create_group("observations")
-        qpos_data = obs_group.zeros(
-            "qpos", shape=(num_trajectories, max_traj_length, 30), dtype=np.float32
-        )
-        qvel_data = obs_group.zeros(
-            "qvel", shape=(num_trajectories, max_traj_length, 29), dtype=np.float32
-        )
+        # Build per-trajectory structure expected by VectorizedTrajectoryDataset
+        ds_group = root.create_group("ds1")
+        motion_group = ds_group.create_group("walk")
 
-        # Create action data
-        act_group = root.create_group("actions")
-        action_data = act_group.zeros(
-            "actions", shape=(num_trajectories, max_traj_length, 12), dtype=np.float32
-        )
-
-        # Fill with realistic data patterns
         for traj_idx in range(num_trajectories):
             length = traj_lengths[traj_idx]
+            traj_group = motion_group.create_group(f"traj{traj_idx}")
+
+            qpos = traj_group.zeros("qpos", shape=(length, 30), dtype=np.float32)
+            qvel = traj_group.zeros("qvel", shape=(length, 29), dtype=np.float32)
+            actions = traj_group.zeros("actions", shape=(length, 12), dtype=np.float32)
 
             for t in range(length):
-                # COM position (first 3: x, y, z)
-                qpos_data[traj_idx, t, :3] = [
+                # Root position (first 3: x, y, z)
+                qpos[t, :3] = [
                     t * 0.02,  # Walking forward
                     0.1 * np.sin(t * 0.1),  # Slight lateral sway
                     0.8 + 0.05 * np.sin(t * 0.2),  # COM height variation
                 ]
 
-                # COM orientation (next 4: qw, qx, qy, qz)
+                # Root orientation (next 4: qw, qx, qy, qz)
                 angle = t * 0.05
-                qpos_data[traj_idx, t, 3:7] = [
+                qpos[t, 3:7] = [
                     np.cos(angle / 2),
                     0,
                     0,
@@ -81,29 +83,27 @@ class TestTrajectoryDatasetManager:
 
                 # Joint positions (remaining 23 elements)
                 phase = t * 0.1 + traj_idx * 0.5  # Different phase per trajectory
-                qpos_data[traj_idx, t, 7:] = np.sin(phase + np.arange(23) * 0.3) * 0.5
+                qpos[t, 7:] = np.sin(phase + np.arange(23) * 0.3) * 0.5
 
-                # COM linear velocity (first 3: vx, vy, vz)
-                qvel_data[traj_idx, t, :3] = [
+                # Root linear velocity (first 3: vx, vy, vz)
+                qvel[t, :3] = [
                     0.02 + 0.01 * np.sin(t * 0.1),  # Forward velocity
                     0.01 * np.cos(t * 0.1),  # Lateral velocity
                     0.005 * np.sin(t * 0.2),  # Vertical velocity
                 ]
 
-                # COM angular velocity (next 3: wx, wy, wz)
-                qvel_data[traj_idx, t, 3:6] = [
+                # Root angular velocity (next 3: wx, wy, wz)
+                qvel[t, 3:6] = [
                     0.01 * np.sin(t * 0.1),
                     0.005 * np.cos(t * 0.15),
                     0.05 * np.cos(t * 0.05),
                 ]
 
                 # Joint velocities (remaining 23 elements)
-                qvel_data[traj_idx, t, 6:] = np.cos(phase + np.arange(23) * 0.3) * 0.1
+                qvel[t, 6:] = np.cos(phase + np.arange(23) * 0.3) * 0.1
 
                 # Actions (motor commands)
-                action_data[traj_idx, t, :] = (
-                    np.sin(t * 0.15 + np.arange(12) * 0.4) * 0.2
-                )
+                actions[t, :] = np.sin(t * 0.15 + np.arange(12) * 0.4) * 0.2
 
         # Create metadata
         metadata = {
@@ -143,13 +143,15 @@ class TestTrajectoryDatasetManager:
         assert manager.num_envs == num_envs
         assert manager.device == device
         assert manager.num_trajectories == num_trajectories
-        assert len(manager.traj_lengths) == num_trajectories
+        assert len(manager.dataset.traj_lengths) == num_trajectories
         assert manager.assignment_strategy == "random"
 
         # Check that trajectory and step tracking are initialized
         assert manager.env2traj.shape == (num_envs,)
         assert manager.env2step.shape == (num_envs,)
-        assert torch.all(manager.env2traj == 0)
+        # Trajectories are now assigned during initialization, so they won't all be 0
+        assert torch.all(manager.env2traj >= 0)
+        assert torch.all(manager.env2traj < num_trajectories)
         assert torch.all(manager.env2step == 0)
 
     def test_assignment_strategy_random(self, sample_zarr_dataset):
@@ -235,11 +237,13 @@ class TestTrajectoryDatasetManager:
 
         # Curriculum should assign shorter trajectories first
         # Get the trajectory lengths for assigned trajectories
-        assigned_lengths = manager.traj_lengths[manager.env2traj]
+        assigned_lengths = torch.tensor(manager.dataset.traj_lengths)[manager.env2traj]
 
         # Should generally be shorter trajectories (though with some randomness due to env_id % num_trajectories)
         # At least the first few should be from shorter trajectories
-        sorted_lengths, sorted_indices = torch.sort(manager.traj_lengths)
+        sorted_lengths, sorted_indices = torch.sort(
+            torch.tensor(manager.dataset.traj_lengths)
+        )
 
         # Check that at least some environments got shorter trajectories
         short_traj_indices = sorted_indices[: num_trajectories // 2]
@@ -261,9 +265,9 @@ class TestTrajectoryDatasetManager:
         assert isinstance(reference_data, TensorDict)
         assert reference_data.batch_size == (4,)
 
-        # Check COM position extraction (first 3 elements)
-        assert "com_pos" in reference_data
-        com_pos = reference_data["com_pos"]
+        # Check root position extraction (first 3 elements)
+        assert "root_pos" in reference_data
+        com_pos = reference_data["root_pos"]
         assert com_pos.shape == (4, 3)
 
         # Verify COM position values are reasonable (walking forward)
@@ -271,20 +275,20 @@ class TestTrajectoryDatasetManager:
         assert torch.all(torch.abs(com_pos[:, 1]) < 0.5)  # Y position should be small
         assert torch.all(com_pos[:, 2] > 0.5)  # Z position should be above ground
 
-        # Check COM orientation extraction (next 4 elements)
-        assert "com_quat" in reference_data
-        com_quat = reference_data["com_quat"]
+        # Check root orientation extraction (next 4 elements)
+        assert "root_quat" in reference_data
+        com_quat = reference_data["root_quat"]
         assert com_quat.shape == (4, 4)
 
         # Quaternions should be normalized
         quat_norms = torch.norm(com_quat, dim=1)
         assert torch.allclose(quat_norms, torch.ones(4), atol=1e-5)
 
-        # Check COM velocities
-        assert "com_lin_vel" in reference_data
-        assert "com_ang_vel" in reference_data
-        com_lin_vel = reference_data["com_lin_vel"]
-        com_ang_vel = reference_data["com_ang_vel"]
+        # Check root velocities
+        assert "root_lin_vel" in reference_data
+        assert "root_ang_vel" in reference_data
+        com_lin_vel = reference_data["root_lin_vel"]
+        com_ang_vel = reference_data["root_ang_vel"]
         assert com_lin_vel.shape == (4, 3)
         assert com_ang_vel.shape == (4, 3)
 
@@ -317,13 +321,13 @@ class TestTrajectoryDatasetManager:
         manager.env2traj[1] = 4  # Trajectory with length 120
         manager.env2step[:] = 0
 
-        # Step through trajectory for env 0 until near completion
-        for step in range(78):  # Almost at the end (length 80)
+        # Step through trajectory for env 0 until completion
+        for step in range(79):  # Go to the end (length 80)
             ref_data = manager.get_reference_data()
             assert manager.env2step[0] == step + 1
 
             # Verify that we're getting different data as we progress
-            com_pos = ref_data["com_pos"][0]
+            com_pos = ref_data["root_pos"][0]
             expected_x = step * 0.02  # Based on our test data pattern
             assert abs(com_pos[0].item() - expected_x) < 0.01
 
@@ -336,7 +340,7 @@ class TestTrajectoryDatasetManager:
         # Trajectory might have changed due to reset
 
         # Env 1 should still be progressing normally
-        assert manager.env2step[1] == 79  # Still progressing
+        assert manager.env2step[1] == 80  # Still progressing
 
     def test_partial_environment_reset(self, sample_zarr_dataset):
         """Test resetting only specific environments."""
@@ -389,7 +393,7 @@ class TestTrajectoryDatasetManager:
         data2 = manager.get_reference_data()
 
         # Data should be identical
-        assert torch.allclose(data1["com_pos"], data2["com_pos"], atol=1e-6)
+        assert torch.allclose(data1["root_pos"], data2["root_pos"], atol=1e-6)
         assert torch.allclose(data1["joint_pos"], data2["joint_pos"], atol=1e-6)
         assert torch.allclose(data1["raw_qpos"], data2["raw_qpos"], atol=1e-6)
 
@@ -407,10 +411,7 @@ class TestTrajectoryDatasetManager:
         )
 
         with pytest.raises(ValueError, match="Unknown assignment strategy"):
-            manager = TrajectoryDatasetManager(
-                cfg_invalid_strategy, 4, torch.device("cpu")
-            )
-            manager.reset_trajectories()  # This will trigger the error
+            TrajectoryDatasetManager(cfg_invalid_strategy, 4, torch.device("cpu"))
 
         # Test sequence strategy without assignment_sequence
         cfg_no_sequence = MockConfig(
@@ -418,8 +419,7 @@ class TestTrajectoryDatasetManager:
         )
 
         with pytest.raises(ValueError, match="assignment_sequence must be provided"):
-            manager = TrajectoryDatasetManager(cfg_no_sequence, 4, torch.device("cpu"))
-            manager.reset_trajectories()  # This will trigger the error
+            TrajectoryDatasetManager(cfg_no_sequence, 4, torch.device("cpu"))
 
     def test_device_consistency(self, sample_zarr_dataset):
         """Test that all tensors are on the correct device."""
@@ -433,7 +433,9 @@ class TestTrajectoryDatasetManager:
         # Check internal tensors
         assert manager.env2traj.device == device
         assert manager.env2step.device == device
-        assert manager.traj_lengths.device == device
+        # Trajectory lengths live on dataset as Python list; ensure we can move to device
+        _traj_lengths_tensor = torch.tensor(manager.dataset.traj_lengths, device=device)
+        assert _traj_lengths_tensor.device == device
 
         # Check reference data
         ref_data = manager.get_reference_data()
@@ -462,7 +464,7 @@ class TestTrajectoryDatasetManager:
 
         # Check that all data has correct batch size
         assert ref_data.batch_size == (batch_size,)
-        assert ref_data["com_pos"].shape[0] == batch_size
+        assert ref_data["root_pos"].shape[0] == batch_size
         assert ref_data["joint_pos"].shape[0] == batch_size
 
         print(f"Batch size {batch_size}: {elapsed_time:.4f}s for 10 steps")

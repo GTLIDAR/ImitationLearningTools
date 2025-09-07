@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, Any
 
 import torch
 from tensordict import TensorDict
@@ -40,6 +40,7 @@ class ExpertMemmapBuilder:
     - Uses `LazyMemmapStorage` to keep host RAM low; data is memory-mapped to disk.
     - Stores transitions as TensorDicts with keys: 'observation', 'action', ('next','observation').
     - Tracks `Segment`s per (task_id, traj_id) for O(1) sequential indexing.
+    - Overwrites existing data in scratch_dir if present (existsok=True).
 
     Workflow:
       builder = ExpertMemmapBuilder(scratch_dir, max_size)
@@ -48,10 +49,22 @@ class ExpertMemmapBuilder:
       storage, segments = builder.finalize()
     """
 
-    def __init__(self, scratch_dir: str | os.PathLike, max_size: int, *, device: str = "cpu") -> None:
+    def __init__(
+        self,
+        scratch_dir: str | os.PathLike,
+        max_size: int,
+        *,
+        device: torch.device | str = "cpu",
+    ) -> None:
         self.scratch_dir = str(scratch_dir)
         Path(self.scratch_dir).mkdir(parents=True, exist_ok=True)
-        self.storage = LazyMemmapStorage(max_size=max_size, device=device, scratch_dir=self.scratch_dir)
+        device_arg = torch.device(device) if isinstance(device, str) else device
+        self.storage = LazyMemmapStorage(
+            max_size=max_size,
+            device=device_arg,
+            scratch_dir=self.scratch_dir,
+            existsok=True,
+        )
         self._size = 0
         self._segments: list[Segment] = []
 
@@ -63,7 +76,9 @@ class ExpertMemmapBuilder:
     def segments(self) -> list[Segment]:
         return list(self._segments)
 
-    def add_trajectory(self, task_id: int, traj_id: int, transitions: TensorDict) -> Segment:
+    def add_trajectory(
+        self, task_id: int, traj_id: int, transitions: TensorDict
+    ) -> Segment:
         """Append one trajectory's transitions to storage.
 
         transitions: TensorDict with batch shape [T] and keys:
@@ -71,16 +86,27 @@ class ExpertMemmapBuilder:
           - 'action': [...]
           - ('next','observation'): [...]
         """
-        if transitions.batch_ndim != 1:
+        if len(transitions.batch_size) != 1:
             raise ValueError("Expected 1-D batch of transitions with shape [T]")
 
         T = transitions.batch_size[0]
         start = self._size
-        self.storage.extend(transitions)
+        # Write the trajectory contiguously into the memmap-backed storage
+        storage_any: Any = self.storage
+        print(
+            f"[ExpertMemmapBuilder] setting storage in dir {self.scratch_dir} with range {start} to {start + T}"
+        )
+        storage_any.set(range(start, start + T), transitions)
         self._size += T
         seg = Segment(task_id=task_id, traj_id=traj_id, start=start, length=T)
         self._segments.append(seg)
         return seg
+
+    def clear(self) -> None:
+        """Clear all stored data and reset the builder state."""
+        self._size = 0
+        self._segments.clear()
+        # Storage will be reinitialized on next add_trajectory call
 
     def finalize(self) -> tuple[LazyMemmapStorage, list[Segment]]:
         return self.storage, list(self._segments)
@@ -93,7 +119,9 @@ class ExpertMemmapBuilder:
 
 def _ensure_1d_batch(t: torch.Tensor, name: str) -> None:
     if t.ndim < 2:
-        raise ValueError(f"{name} must have a batch/time dimension: got shape {t.shape}")
+        raise ValueError(
+            f"{name} must have a batch/time dimension: got shape {t.shape}"
+        )
 
 
 def concat_components(parts: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -106,7 +134,7 @@ def concat_components(parts: Sequence[torch.Tensor]) -> torch.Tensor:
         raise ValueError("concat_components received an empty sequence")
     for i, p in enumerate(parts):
         _ensure_1d_batch(p, f"parts[{i}]")
-    return torch.cat(parts, dim=-1)
+    return torch.cat(list(parts), dim=-1)
 
 
 def build_trajectory_td(
@@ -149,5 +177,6 @@ def build_trajectory_td_from_components(
     """
     obs = concat_components(obs_parts)
     next_obs = concat_components(next_obs_parts)
-    return build_trajectory_td(observation=obs, action=action, next_observation=next_obs)
-
+    return build_trajectory_td(
+        observation=obs, action=action, next_observation=next_obs
+    )

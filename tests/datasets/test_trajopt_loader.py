@@ -1,8 +1,13 @@
 import pytest
 import numpy as np
-import torch
+
+try:
+    import torch
+except Exception:
+    pytest.skip("PyTorch not available", allow_module_level=True)
+
 from pathlib import Path
-from src.iltools_datasets.trajopt.loader import TrajoptLoader, TrajoptTrajectoryDataset
+from iltools_datasets.trajopt.loader import TrajoptLoader, TrajoptTrajectoryDataset
 
 
 def create_fake_trajopt_npz(tmp_path, n=2, T=10):

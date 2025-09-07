@@ -32,33 +32,37 @@ class TrajectoryDatasetManager:
         """
         self.cfg = cfg
         # store the joint sequence we need to export to, note that this must use the same joint names as the dataset
-        assert cfg.target_joint_names is not None, (
-            "target_joint_names must be provided in the config."
-        )
+        assert (
+            cfg.target_joint_names is not None
+        ), "target_joint_names must be provided in the config."
         self.target_joint_names = cfg.target_joint_names
 
         # store the joint sequence we need to extract from the dataset.
         # This list of names might not be the same as provided in the dataset,
         # but should match the name string convention specified in target_joint_names
-        assert cfg.reference_joint_names is not None, (
-            "reference_joint_names must be provided in the config."
-        )
+        assert (
+            cfg.reference_joint_names is not None
+        ), "reference_joint_names must be provided in the config."
         self.reference_joint_names = cfg.reference_joint_names
 
         self.num_envs = num_envs
         self._device = device  # type: ignore
+        print(f"[TrajectoryDatasetManager] Using device: {self._device}")
 
         # Core configuration
         self.dataset_path = self._validate_dataset_path(cfg)
         self.assignment_strategy = getattr(cfg, "assignment_strategy", "random")
         self.assignment_sequence = getattr(cfg, "assignment_sequence", None)
 
+        # Validate assignment strategy early
+        self._validate_assignment_strategy()
+
         # Initialize dataset
         self.dataset = self._initialize_dataset(cfg)
 
         # Trajectory tracking
-        self.env2traj = torch.zeros(num_envs, dtype=torch.long, device=device)
-        self.env2step = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.env2traj = torch.zeros(num_envs, dtype=torch.long, device=self._device)
+        self.env2step = torch.zeros(num_envs, dtype=torch.long, device=self._device)
 
         # Cache trajectory info from dataset
         self.num_trajectories = len(self.dataset.available_trajectories)
@@ -71,21 +75,29 @@ class TrajectoryDatasetManager:
             self.reference_joint_names, self.target_joint_names
         )
         self.target_mask = torch.zeros(
-            len(self.target_joint_names), dtype=torch.bool, device=device
+            len(self.target_joint_names), dtype=torch.bool, device=self._device
         )
         self.target_mask[self.ref_to_target_map] = True
 
         # Memory allocate for important data
         self.joint_pos = torch.empty(
-            num_envs, len(self.target_joint_names), device=device
+            num_envs, len(self.target_joint_names), device=self._device
         )
         self.joint_vel = torch.empty(
-            num_envs, len(self.target_joint_names), device=device
+            num_envs, len(self.target_joint_names), device=self._device
         )
-        self.root_pos = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
-        self.root_quat = torch.empty(num_envs, 4, device=device, dtype=torch.float32)
-        self.root_lin_vel = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
-        self.root_ang_vel = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
+        self.root_pos = torch.empty(
+            num_envs, 3, device=self._device, dtype=torch.float32
+        )
+        self.root_quat = torch.empty(
+            num_envs, 4, device=self._device, dtype=torch.float32
+        )
+        self.root_lin_vel = torch.empty(
+            num_envs, 3, device=self._device, dtype=torch.float32
+        )
+        self.root_ang_vel = torch.empty(
+            num_envs, 3, device=self._device, dtype=torch.float32
+        )
 
         # Pre-allocate reference data TensorDict for better performance
         self.reference_data = TensorDict(
@@ -116,6 +128,9 @@ class TrajectoryDatasetManager:
         print(
             f"[TrajectoryDatasetManager] Initialized with {self.num_trajectories} trajectories, {num_envs} envs"
         )
+
+        # Initialize trajectory assignments
+        self.reset_trajectories()
 
     @property
     def device(self) -> torch.device:
@@ -149,12 +164,12 @@ class TrajectoryDatasetManager:
             ) % self.num_trajectories
         elif self.assignment_strategy == "sequence":
             # Use predefined sequence
-            assert self.assignment_sequence is not None, (
-                "assignment_sequence must be provided when using 'sequence' strategy"
-            )
+            assert (
+                self.assignment_sequence is not None
+            ), "assignment_sequence must be provided when using 'sequence' strategy"
             assert isinstance(self.assignment_sequence, list)
             for env_id in env_ids:
-                seq_idx = int(env_id)
+                seq_idx = int(env_id) % len(self.assignment_sequence)
                 self.env2traj[env_id] = self.assignment_sequence[seq_idx]  # type: ignore
         elif self.assignment_strategy == "curriculum":
             # Simple curriculum: start with shorter trajectories
@@ -244,8 +259,35 @@ class TrajectoryDatasetManager:
         self.reference_data["joint_pos"] = self.joint_pos.clone()
         self.reference_data["joint_vel"] = self.joint_vel.clone()
 
-        # Increment step counters
-        self.env2step += 1
+        # Check for trajectory completion and reset if needed BEFORE incrementing
+        for env_id in range(self.num_envs):
+            traj_id = self.env2traj[env_id].item()
+            traj_length = self.dataset.traj_lengths[traj_id]
+            current_step = self.env2step[env_id].item()
+            if current_step >= traj_length - 1:  # Check if we're at the last step
+                # Reset this environment to a new trajectory
+                self.env2step[env_id] = 0
+                # Assign new trajectory based on strategy
+                if self.assignment_strategy == "random":
+                    self.env2traj[env_id] = torch.randint(
+                        0, self.num_trajectories, (1,), device=self.device
+                    ).item()
+                elif self.assignment_strategy == "sequential":
+                    self.env2traj[env_id] = env_id % self.num_trajectories
+                elif self.assignment_strategy == "round_robin":
+                    traj_id = self._round_robin_counter % self.num_trajectories
+                    self.env2traj[env_id] = traj_id
+                    self._round_robin_counter = (
+                        self._round_robin_counter + 1
+                    ) % self.num_trajectories
+                elif self.assignment_strategy == "sequence":
+                    seq_idx = env_id % len(self.assignment_sequence)
+                    self.env2traj[env_id] = self.assignment_sequence[seq_idx]
+                elif self.assignment_strategy == "curriculum":
+                    self.env2traj[env_id] = env_id % self.num_trajectories
+            else:
+                # Only increment if not reset
+                self.env2step[env_id] += 1
 
         # Update dataset with new step positions
         env_to_step = {
@@ -262,6 +304,23 @@ class TrajectoryDatasetManager:
         if dataset_path is None:
             raise ValueError("dataset_path must be provided in the config.")
         return dataset_path
+
+    def _validate_assignment_strategy(self) -> None:
+        """Validate the assignment strategy configuration."""
+        valid_strategies = [
+            "random",
+            "sequential",
+            "round_robin",
+            "sequence",
+            "curriculum",
+        ]
+        if self.assignment_strategy not in valid_strategies:
+            raise ValueError(f"Unknown assignment strategy: {self.assignment_strategy}")
+
+        if self.assignment_strategy == "sequence" and self.assignment_sequence is None:
+            raise ValueError(
+                "assignment_sequence must be provided when using 'sequence' strategy"
+            )
 
     def _initialize_dataset(self, cfg: Any) -> VectorizedTrajectoryDataset:
         """Initialize or create the Zarr dataset."""

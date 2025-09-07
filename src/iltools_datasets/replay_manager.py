@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 from tensordict import TensorDict
 from torchrl.data import LazyMemmapStorage, TensorDictReplayBuffer
-from torchrl.data.replay_buffers.samplers import SamplerBase, SamplerWithoutReplacement
+from torchrl.data.replay_buffers.samplers import Sampler, SamplerWithoutReplacement
 
 from .replay_memmap import ExpertMemmapBuilder, Segment
 
@@ -20,7 +20,7 @@ class EnvAssignment:
     step: int = 0
 
 
-class SequentialPerEnvSampler(SamplerBase):
+class SequentialPerEnvSampler(Sampler):
     """Custom sampler that returns the next index for each env sequentially.
 
     - Each env is assigned a (task_id, traj_id) segment.
@@ -29,7 +29,9 @@ class SequentialPerEnvSampler(SamplerBase):
     - This keeps DeepMimic-style synchronized marching through reference clips.
     """
 
-    def __init__(self, *, segments: Sequence[Segment], assignment: list[EnvAssignment]) -> None:
+    def __init__(
+        self, *, segments: Sequence[Segment], assignment: list[EnvAssignment]
+    ) -> None:
         super().__init__()
         # Build lookup: (task_id, traj_id) -> Segment
         self._seg_by_key: dict[tuple[int, int], Segment] = {
@@ -43,14 +45,50 @@ class SequentialPerEnvSampler(SamplerBase):
             raise ValueError("Assignment length must match num_envs")
         self.assignment = assignment
 
-    def sample(self, storage: LazyMemmapStorage, batch_size: Optional[int] = None) -> torch.Tensor:  # type: ignore[override]
+    def sample(self, storage: LazyMemmapStorage, batch_size: Optional[int] = None) -> tuple[torch.Tensor, dict]:  # type: ignore[override]
         # TorchRL will pass batch_size, but we ignore it and return one index per env.
         idx = torch.empty((self.num_envs,), dtype=torch.int64)
         for i, a in enumerate(self.assignment):
             seg = self._seg_by_key[(a.task_id, a.traj_id)]
             idx[i] = seg.index_at(a.step, wrap=True)
             a.step += 1
-        return idx
+        return idx, {}
+
+    def _empty(self):
+        """Empty method required by abstract base class."""
+        pass
+
+    def dumps(self, path):
+        """Dumps method required by abstract base class."""
+        # No-op for this sampler as it doesn't need to persist state
+        pass
+
+    def loads(self, path):
+        """Loads method required by abstract base class."""
+        # No-op for this sampler as it doesn't need to persist state
+        pass
+
+    def state_dict(self) -> dict[str, Any]:
+        """Returns state dict for serialization."""
+        return {
+            "assignment": [
+                {"task_id": a.task_id, "traj_id": a.traj_id, "step": a.step}
+                for a in self.assignment
+            ],
+            "num_envs": self.num_envs,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Loads state dict for deserialization."""
+        if "assignment" in state_dict:
+            self.assignment = [
+                EnvAssignment(
+                    task_id=a["task_id"], traj_id=a["traj_id"], step=a["step"]
+                )
+                for a in state_dict["assignment"]
+            ]
+        if "num_envs" in state_dict:
+            self.num_envs = state_dict["num_envs"]
 
 
 @dataclass
@@ -87,7 +125,7 @@ class ExpertReplayManager:
         total_T = 0
         for t_id, trajs in spec.tasks.items():
             for td in trajs:
-                if td.batch_ndim != 1:
+                if len(td.batch_size) != 1:
                     raise ValueError("Each trajectory must have batch shape [T]")
                 total_T += td.batch_size[0]
 
@@ -95,13 +133,15 @@ class ExpertReplayManager:
         segments: list[Segment] = []
         for task_id, trajs in spec.tasks.items():
             for traj_id, td in enumerate(trajs):
-                seg = builder.add_trajectory(task_id=task_id, traj_id=traj_id, transitions=td)
+                seg = builder.add_trajectory(
+                    task_id=task_id, traj_id=traj_id, transitions=td
+                )
                 segments.append(seg)
 
         storage, segments = builder.finalize()
 
         # Default to uniform sampler; caller can switch to sequential via set_assignment()
-        self._sampler: SamplerBase | None = None
+        self._sampler: Sampler | None = None
         self._assignment: list[EnvAssignment] | None = None
 
         # Create the replay buffer (lives on CPU; consumer can move to device during .sample())
@@ -111,22 +151,36 @@ class ExpertReplayManager:
             sampler=self._sampler,  # may be None; default sampler is uniform
             prefetch=3,
             pin_memory=False,
-            device="cpu",
             shared=False,
         )
 
         self._segments = segments
+        self._transforms: list[Any] = (
+            []
+        )  # Store transforms to restore after buffer recreation
 
     @property
     def segments(self) -> list[Segment]:
         return list(self._segments)
 
-    def set_device_transform(self, device: torch.device, non_blocking: bool = True) -> None:
+    def _restore_transforms(self) -> None:
+        """Restore transforms that were previously applied to the buffer."""
+        for transform in self._transforms:
+            self.buffer.append_transform(transform)
+
+    def set_device_transform(
+        self, device: torch.device, non_blocking: bool = True
+    ) -> None:
         """Make the buffer yield batches already moved to `device`.
 
         This overlaps H2D copies with compute when prefetch>0.
         """
-        self.buffer.append_transform(lambda td: td.to(device, non_blocking=non_blocking))
+
+        def device_transform(td):
+            return td.to(device, non_blocking=non_blocking)
+
+        self._transforms.append(device_transform)
+        self.buffer.append_transform(device_transform)
 
     def set_assignment(self, assignment: Sequence[EnvAssignment]) -> None:
         """Enable per-env sequential sampling by setting an assignment.
@@ -135,7 +189,9 @@ class ExpertReplayManager:
         of shape [num_envs], one per env, advancing each env's step pointer.
         """
         self._assignment = list(assignment)
-        self._sampler = SequentialPerEnvSampler(segments=self._segments, assignment=self._assignment)
+        self._sampler = SequentialPerEnvSampler(
+            segments=self._segments, assignment=self._assignment
+        )
         # Recreate the buffer with the sequential sampler, batch_size ignored by sampler
         self.buffer = TensorDictReplayBuffer(
             storage=self.buffer._storage,  # reuse existing storage
@@ -143,9 +199,10 @@ class ExpertReplayManager:
             sampler=self._sampler,
             prefetch=3,
             pin_memory=False,
-            device="cpu",
             shared=False,
         )
+        # Preserve any transforms that were previously applied
+        self._restore_transforms()
 
     def clear_assignment(self) -> None:
         """Revert to default (uniform) sampling over all transitions."""
@@ -157,11 +214,14 @@ class ExpertReplayManager:
             sampler=None,
             prefetch=3,
             pin_memory=False,
-            device="cpu",
             shared=False,
         )
+        # Preserve any transforms that were previously applied
+        self._restore_transforms()
 
-    def set_uniform_sampler(self, *, batch_size: Optional[int] = None, without_replacement: bool = True) -> None:
+    def set_uniform_sampler(
+        self, *, batch_size: Optional[int] = None, without_replacement: bool = True
+    ) -> None:
         """Switch to uniform minibatch sampling suitable for IPMD.
 
         - If `without_replacement=True`, uses `SamplerWithoutReplacement`.
@@ -178,11 +238,12 @@ class ExpertReplayManager:
             sampler=self._sampler,
             prefetch=3,
             pin_memory=False,
-            device="cpu",
             shared=False,
         )
+        # Preserve any transforms that were previously applied
+        self._restore_transforms()
 
-    def set_custom_sampler(self, sampler: SamplerBase, *, batch_size: int) -> None:
+    def set_custom_sampler(self, sampler: Sampler, *, batch_size: int) -> None:
         """Attach any TorchRL sampler (e.g., weighted) for flexible minibatching."""
         self._assignment = None
         self._sampler = sampler
@@ -192,7 +253,7 @@ class ExpertReplayManager:
             sampler=self._sampler,
             prefetch=3,
             pin_memory=False,
-            device="cpu",
             shared=False,
         )
-
+        # Preserve any transforms that were previously applied
+        self._restore_transforms()

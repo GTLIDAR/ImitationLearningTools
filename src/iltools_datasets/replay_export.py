@@ -222,7 +222,7 @@ def build_replay_from_zarr(
                 td.set("terminated", term_tensor)
             if trunc_tensor is not None:
                 td.set("truncated", trunc_tensor)
-
+        print(f"[build_replay_from_zarr] td: {td}")
         # Append to builder and record in tasks
         builder.add_trajectory(task_id=task_id, traj_id=traj_id, transitions=td)
         tasks.setdefault(task_id, []).append(td)

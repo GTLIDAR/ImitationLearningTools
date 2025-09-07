@@ -16,12 +16,12 @@ class TrajoptLoader(BaseLoader):
     def __init__(self, data_path: str):
         self.data_path = Path(data_path)
         self._trajectory_lengths = []
-        self._metadata = self._load_metadata()
         self._file_list = sorted(list(self.data_path.glob("*.npz")))
         self._dt = 0.02
         self._joint_names = ["joint1", "joint2", "joint3"]
         self._body_names = ["body1", "body2"]
         self._site_names = ["site1", "site2"]
+        self._metadata = self._load_metadata()
 
     def _load_metadata(self) -> DatasetMeta:
         """
@@ -61,6 +61,54 @@ class TrajoptLoader(BaseLoader):
 
     def as_dataset(self, **kwargs) -> "TrajoptTrajectoryDataset":
         return TrajoptTrajectoryDataset(self, **kwargs)
+
+    def save(self, path: str, **kwargs) -> None:
+        """
+        Saves the dataset to a directory using zarr format.
+        """
+        import zarr
+        import os
+
+        # Create zarr store
+        store = zarr.DirectoryStore(path)
+        root = zarr.group(store=store, overwrite=True)
+
+        # Create dataset group
+        ds_group = root.create_group("ds1")
+        motion_group = ds_group.create_group("trajopt")
+
+        # Save each trajectory
+        for i, file_path in enumerate(self._file_list):
+            data = np.load(file_path)
+            traj_group = motion_group.create_group(f"traj{i}")
+
+            # Save trajectory data
+            traj_group.create_dataset("qpos", data=data["qpos"], dtype=np.float32)
+            traj_group.create_dataset("qvel", data=data["qvel"], dtype=np.float32)
+            traj_group.create_dataset("actions", data=data["actions"], dtype=np.float32)
+
+            # Save metadata
+            if "dt" in data:
+                traj_group.create_dataset("dt", data=data["dt"], dtype=np.float32)
+
+        # Save metadata.json
+        metadata_path = os.path.join(os.path.dirname(path), "metadata.json")
+        metadata_dict = {
+            "num_trajectories": len(self._file_list),
+            "trajectory_lengths": self._trajectory_lengths,
+            "observation_keys": ["qpos", "qvel"],
+            "action_keys": ["actions"],
+            "window_size": 64,
+            "export_control_freq": 50.0,
+            "original_frequency": 100.0,
+            "effective_frequency": 50.0,
+            "dt": [self._dt for _ in range(len(self._file_list))],
+        }
+
+        import json
+
+        with open(metadata_path, "w") as f:
+            json.dump(metadata_dict, f)
 
     @property
     def metadata(self) -> DatasetMeta:
