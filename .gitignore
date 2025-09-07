@@ -177,3 +177,8 @@ MUJOCO_LOG.TXT
 # video and zip
 *.mp4
 *.zip
+
+# editor settings
+.vscode/
+.zed/
+.cursor/
