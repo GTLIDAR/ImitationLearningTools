@@ -54,11 +54,12 @@ mgr.update_env_assignment(env_index=3, task_id=2, traj_id=5, step=0)
 mgr.update_assignments({0: (1, 2), 7: (2, 0, 10)})
 ```
 
-Move sampled batches to device with prefetch overlap:
+Move sampled batches to device:
 
 ```python
 import torch
-mgr.set_device_transform(device=torch.device("cuda"))
+batch = mgr.buffer.sample()
+batch = batch.to(torch.device("cuda"))  # Buffer storage handles device transforms automatically
 ```
 
 ## Components
@@ -106,7 +107,7 @@ storage, segments = b.finalize()
 - Convenient updates:
   - `update_env_assignment(i, task_id, traj_id, step=0)`
   - `update_assignments({env: (task, traj[, step]), ...})`
-- Device transform: `set_device_transform(torch.device("cuda"))`
+- Device handling: Buffer storage automatically manages device transforms
 
 ## Zarr → Replay in One Call
 
@@ -119,7 +120,7 @@ Parameters (high‑level):
 - `include_terminated` / `include_truncated`: attach TorchRL flags when available.
 
 ## Tips
-- Storage lives on CPU; use `set_device_transform` to overlap H2D copies with compute when using `prefetch>0`.
+- Storage lives on CPU; buffer storage automatically handles device transforms when sampling.
 - Switching samplers reuses the same memmap storage; transforms are preserved.
 - For assigned‑uniform without replacement, the sampler reshuffles once its internal epoch is exhausted or when assignments change.
 
@@ -133,7 +134,7 @@ Parameters (high‑level):
   - `update_env_assignment(env_index, task_id, traj_id, step=0)`
   - `update_assignments({env: (task, traj[, step])})`
   - `set_uniform_sampler(batch_size, without_replacement=True, respect_assignment=True)`
-  - `set_device_transform(device)`
+  - Device transforms are handled automatically by buffer storage
   - `clear_assignment()`
 
 That’s it — compact building blocks to get expert data streaming reliably into your training loop.

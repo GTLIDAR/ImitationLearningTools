@@ -311,9 +311,12 @@ class ExpertReplayManager:
         )
 
         self._segments = segments
-        self._transforms: list[Any] = (
-            []
-        )  # Store transforms to restore after buffer recreation
+        self._transforms: list[Any] = []
+
+        if spec.device != "cpu":
+            print(f"Appending device transform to buffer: {spec.device}")
+            self._transforms.append(lambda td: td.to(spec.device))  # type: ignore[arg-type]
+            self._restore_transforms()
 
     @property
     def segments(self) -> list[Segment]:

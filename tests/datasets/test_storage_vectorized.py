@@ -30,8 +30,8 @@ def _create_simple_zarr(root_dir: str) -> Tuple[str, list[int]]:
         g_traj.zeros(name="action", shape=(L, 3), dtype=np.float32)
         # Fill with recognizable values: qpos[t, 0] = 100*i + t; qvel[t, 0] = 200*i + t
         for t in range(L):
-            qpos[t, 0] = 100 * i + t
-            qvel[t, 0] = 200 * i + t
+            qpos[t, :] = 100 * i + t
+            qvel[t, :] = 200 * i + t
 
     return zarr_path, lengths
 

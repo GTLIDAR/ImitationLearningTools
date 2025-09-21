@@ -218,8 +218,9 @@ importlib.reload(iltools_datasets.replay_manager)
 
 target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Target device:", target_device)
-replay_mgr.set_device_transform(target_device)
 bs = replay_mgr.buffer.sample()
+# Move the batch to target device manually since buffer storage handles device transforms automatically
+bs = bs.to(target_device)
 print("Device:", bs["observation"].device)
 print("Device types match:", bs["observation"].device.type == target_device.type)
 if bs["observation"].device.type == target_device.type:
