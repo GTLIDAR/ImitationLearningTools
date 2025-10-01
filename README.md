@@ -21,11 +21,18 @@ We recommend using the `conda-forge` channel for managing dependencies. For a fa
 
 3.  **Install the project:**
 
-    First, install [```loco-mujoco```](https://github.com/robfiras/loco-mujoco.git).
-
-    Then from the root of this repository, run:
+    Base install (without Loco‑MuJoCo):
     ```bash
     uv pip install -e .
+    ```
+
+    If you need Loco‑MuJoCo support (dataset loader, tests, viewers), install the optional extra:
+    ```bash
+    uv pip install -e .[loco-mujoco]
+    ```
+    Alternatively with pip:
+    ```bash
+    pip install -e .[loco-mujoco]
     ```
     *Note: Using the `-e` flag installs the project in "editable" mode, which is recommended for development.*
 
@@ -72,7 +79,7 @@ Dataset/
 └── ...
 ```
 
-E.g. We currently support ```loco-mujoco``` dataset with various motions such as ```default-walk``` with ```1``` trajectory. 
+E.g. We currently support ```loco-mujoco``` dataset with various motions such as ```default-walk``` with ```1``` trajectory. Install the optional extra to enable this loader.
 
 ## Usage
 
@@ -130,10 +137,11 @@ for _ in range(1000):  # Simulate 1000 steps
 
 To verify that the `loco_mujoco` dataset loader is working correctly, you can run the specific test file for it. This is currently the recommended test to run.
 
-First, ensure you have the necessary test dependencies installed:
+First, ensure you have the necessary test dependencies installed (including the optional extra):
 
 ```bash
 uv pip install pytest numpy torch omegaconf zarr mujoco
+uv pip install -e .[loco-mujoco]
 ```
 
 Then, run the following command from the root of the project:

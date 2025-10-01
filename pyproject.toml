@@ -21,11 +21,16 @@ dependencies = [
     "tqdm",
     "gymnasium>=1.2",
     "torch",
-    "tensordict>=0.9",
+    "tensordict>=0.10",
     "mujoco",
     "mediapy",
     "matplotlib",
     "pytest",
+    
+]
+
+[project.optional-dependencies]
+"loco-mujoco" = [
     "loco-mujoco",
 ]
 

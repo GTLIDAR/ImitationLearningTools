@@ -179,3 +179,40 @@ class VectorizedTrajectoryDataset(BaseDataset):
             data_list.append(self.buffers[env_id][key][local_idx])
 
         return np.stack(data_list, axis=0)
+
+    def fetch_window(
+        self,
+        idx: Iterable[int],
+        key: Optional[str],
+        window_size: int,
+    ) -> np.ndarray:
+        """Return a fixed-length window [num_envs, window_size, ...] for each env.
+
+        This uses the same internal buffering as `fetch`, advancing a temporary
+        step cursor for each env to collect a contiguous window starting at the
+        env's current step. Steps are wrapped when `allow_wrap=True`.
+        """
+        assert key is not None, "key must be provided (e.g., 'qpos')"
+        env_ids = list(idx)
+        # Snapshot current steps
+        original_steps = {env_id: self.env_steps[env_id] for env_id in env_ids}
+        try:
+            per_t = []
+            for dt in range(window_size):
+                # Set per-env temporary steps for this slice
+                for env_id in env_ids:
+                    traj_id = self.env_traj_ids[env_id]
+                    traj_length = self.traj_lengths[traj_id]
+                    step = original_steps[env_id] + dt
+                    if self.allow_wrap and traj_length > 0:
+                        step = step % traj_length
+                    self.env_steps[env_id] = step
+                # Fetch values at these steps
+                per_t.append(self.fetch(env_ids, key))
+            # Shape: [window_size, num_envs, ...] -> transpose to [num_envs, window_size, ...]
+            stacked = np.stack(per_t, axis=0)
+            return np.moveaxis(stacked, 0, 1)
+        finally:
+            # Restore original steps
+            for env_id, step in original_steps.items():
+                self.env_steps[env_id] = step

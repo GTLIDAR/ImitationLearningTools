@@ -1,7 +1,18 @@
 """Init for src/imtools_datasets."""
 
 from .base_loader import BaseDataset, BaseLoader
-from .loco_mujoco.loader import LocoMuJoCoLoader
+
+try:
+    from .loco_mujoco.loader import LocoMuJoCoLoader
+except Exception:  # pragma: no cover
+    # Optional dependency not installed; expose a placeholder for nicer error messages
+    class LocoMuJoCoLoader:  # type: ignore
+        def __init__(self, *_, **__):
+            raise ImportError(
+                "LocoMuJoCoLoader requires the 'loco-mujoco' extra. Install via: pip install -e .[loco-mujoco]"
+            )
+
+
 from .storage import VectorizedTrajectoryDataset
 from .replay_memmap import (
     Segment,

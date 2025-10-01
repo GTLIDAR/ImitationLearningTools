@@ -1,1 +1,3 @@
-"""Init for src/imtools_datasets/loco_mujoco."""
+"""Trajopt support for ImitationLearningTools."""
+
+from .digit_refs import DigitTrajoptRefBuilder  # noqa: F401

@@ -62,66 +62,117 @@ class TrajoptLoader(BaseLoader):
     def as_dataset(self, **kwargs) -> "TrajoptTrajectoryDataset":
         return TrajoptTrajectoryDataset(self, **kwargs)
 
-    def save(self, path: str, **kwargs) -> None:
-        """
-        Saves the dataset to a directory using zarr format.
+    def save(
+        self,
+        out_dir: str,
+        *,
+        dataset_source: str = "trajopt",
+        motion: str | None = None,
+        zarr_name: str = "trajectories.zarr",
+        max_trajs_per_motion: int | None = None,
+    ) -> str:
+        """Export trajopt npz directories to Zarr for vectorized access.
+
+        Default behavior (motion=None):
+          - Treat `data_path` as a root directory with subdirectories per motion
+            (e.g., data_path/<motion>/traj_*.npz or *.npz), and export ALL motions
+            into a single Zarr store.
+
+        If `motion` is provided:
+          - If `data_path/<motion>` exists, export that subdirectory.
+          - Otherwise, treat `data_path` itself as the directory containing the
+            motion's .npz files.
+
+        Layout mirrors what `VectorizedTrajectoryDataset` expects:
+
+            <out_dir>/<zarr_name>/<dataset_source>/<motion>/traj{i}/{qpos,qvel,action[,ee_pos]}
+
+        Returns the Zarr path created.
         """
         import zarr
         from zarr.storage import LocalStore
         import os
 
-        # Create zarr store
-        store = LocalStore(path)
-        root = zarr.group(store=store, overwrite=True)
+        os.makedirs(out_dir, exist_ok=True)
+        zarr_path = os.path.join(out_dir, zarr_name)
+        store = LocalStore(zarr_path)
+        # Ensure Zarr v3 format
+        root = zarr.group(store=store, overwrite=True, zarr_format=3)
 
-        # Create dataset group
-        ds_group = root.create_group("ds1")
-        motion_group = ds_group.create_group("trajopt")
+        ds_group = root.create_group(dataset_source)
 
-        # Save each trajectory
-        for i, file_path in enumerate(self._file_list):
-            data = np.load(file_path)
-            traj_group = motion_group.create_group(f"traj{i}")
+        def _npz_files_in(directory: Path) -> list[Path]:
+            files = sorted(list(directory.glob("traj_*.npz")))
+            if not files:
+                files = sorted(list(directory.glob("*.npz")))
+            return files
 
-            # Save trajectory data
-            qpos_ds = traj_group.create_dataset(
-                "qpos", shape=data["qpos"].shape, dtype=np.float32
+        motions_to_export: list[tuple[str, list[Path]]] = []
+
+        if motion is None:
+            # enumerate subdirectories under data_path as motions
+            for sub in sorted(p for p in self.data_path.iterdir() if p.is_dir()):
+                files = _npz_files_in(sub)
+                if files:
+                    motions_to_export.append((sub.name, files))
+        else:
+            # specific motion: prefer data_path/<motion>, fallback to data_path
+            motion_dir = self.data_path / motion
+            if motion_dir.is_dir():
+                files = _npz_files_in(motion_dir)
+            else:
+                files = _npz_files_in(self.data_path)
+            motions_to_export.append(
+                (motion if motion_dir.is_dir() else "default", files)
             )
-            qpos_ds[:] = data["qpos"]
-            qvel_ds = traj_group.create_dataset(
-                "qvel", shape=data["qvel"].shape, dtype=np.float32
-            )
-            qvel_ds[:] = data["qvel"]
-            actions_ds = traj_group.create_dataset(
-                "actions", shape=data["actions"].shape, dtype=np.float32
-            )
-            actions_ds[:] = data["actions"]
 
-            # Save metadata
-            if "dt" in data:
-                dt_ds = traj_group.create_dataset(
-                    "dt", shape=data["dt"].shape, dtype=np.float32
-                )
-                dt_ds[:] = data["dt"]
+        self._trajectory_lengths = []
+        for motion_name, file_list in motions_to_export:
+            if max_trajs_per_motion is not None:
+                file_list = file_list[:max_trajs_per_motion]
+            motion_group = ds_group.create_group(motion_name)
+            for i, file_path in enumerate(file_list):
+                with np.load(file_path) as data:
+                    traj_group = motion_group.create_group(f"traj{i}")
 
-        # Save metadata.json
-        metadata_path = os.path.join(os.path.dirname(path), "metadata.json")
-        metadata_dict = {
-            "num_trajectories": len(self._file_list),
-            "trajectory_lengths": self._trajectory_lengths,
-            "observation_keys": ["qpos", "qvel"],
-            "action_keys": ["actions"],
-            "window_size": 64,
-            "export_control_freq": 50.0,
-            "original_frequency": 100.0,
-            "effective_frequency": 50.0,
-            "dt": [self._dt for _ in range(len(self._file_list))],
-        }
+                    qpos = np.asarray(data["qpos"], dtype=np.float32)
+                    qvel = np.asarray(data["qvel"], dtype=np.float32)
+                    action_key = (
+                        "action"
+                        if "action" in data
+                        else ("actions" if "actions" in data else None)
+                    )
+                    act = (
+                        np.asarray(data[action_key], dtype=np.float32)
+                        if action_key is not None
+                        else None
+                    )
+                    ee = (
+                        np.asarray(data["ee_pos"], dtype=np.float32)
+                        if "ee_pos" in data
+                        else None
+                    )
 
-        import json
+                    # Create arrays (Zarr v3 API)
+                    traj_group.create_array("qpos", shape=qpos.shape, dtype=qpos.dtype)[
+                        :
+                    ] = qpos
+                    traj_group.create_array("qvel", shape=qvel.shape, dtype=qvel.dtype)[
+                        :
+                    ] = qvel
+                    if act is not None:
+                        traj_group.create_array(
+                            "action", shape=act.shape, dtype=act.dtype
+                        )[:] = act
+                    if ee is not None:
+                        traj_group.create_array(
+                            "ee_pos", shape=ee.shape, dtype=ee.dtype
+                        )[:] = ee
 
-        with open(metadata_path, "w") as f:
-            json.dump(metadata_dict, f)
+                    # Track lengths (aggregate over motions)
+                    self._trajectory_lengths.append(qpos.shape[0])
+
+        return zarr_path
 
     @property
     def metadata(self) -> DatasetMeta:
@@ -133,6 +184,7 @@ class TrajoptLoader(BaseLoader):
 
 # PyTorch Dataset for TrajoptLoader
 class TrajoptTrajectoryDataset(BaseDataset):
+
     def __init__(self, loader: TrajoptLoader, device="cpu"):
         self.loader = loader
         self.device = device
