@@ -54,6 +54,10 @@ class VectorizedTrajectoryDataset(BaseDataset):
         self.window_starts = np.array([0] * self.num_envs)
         self.buffers = np.array([{} for _ in range(self.num_envs)])
         self.handlers = {}
+
+        # Build dataset cache first to avoid repeated filesystem traversal
+        self._build_dataset_cache()
+
         # Gather trajectory lengths and validate key consistency
         self.traj_lengths = []
         self.all_keys = None
@@ -71,42 +75,59 @@ class VectorizedTrajectoryDataset(BaseDataset):
                 raise KeyError(f"Trajectory {traj} missing required key 'qpos'")
             self.traj_lengths.append(group["qpos"].shape[0])
         self.traj_lengths = np.array(self.traj_lengths)
+
         # Make mypy happy
         if self.all_keys is None:
             self.all_keys = []
 
+    def _build_dataset_cache(self):
+        """Build cache for dataset structure to avoid repeated filesystem traversal."""
+        self._cached_dataset_sources = list(self.zarr_dataset.keys())
+        self._cached_motions_by_source = {}
+        self._cached_trajectories_by_motion = {}
+        self._cached_trajectories = []
+
+        for dataset_source in self._cached_dataset_sources:
+            dataset_source_group = self.zarr_dataset[dataset_source]
+            assert isinstance(dataset_source_group, zarr.Group)
+            motions = list(dataset_source_group.keys())
+            self._cached_motions_by_source[dataset_source] = motions
+
+            for motion in motions:
+                motion_group = dataset_source_group[motion]
+                assert isinstance(motion_group, zarr.Group)
+                trajectories = sorted(list(motion_group.keys()))
+                self._cached_trajectories_by_motion[(dataset_source, motion)] = (
+                    trajectories
+                )
+
+                # Build full trajectory paths
+                for trajectory in trajectories:
+                    self._cached_trajectories.append(
+                        f"{dataset_source}/{motion}/{trajectory}"
+                    )
+
     @property
     def available_dataset_sources(self) -> list[str]:
-        return list(self.zarr_dataset.keys())
+        return self._cached_dataset_sources
 
     @property
     def available_motions(self) -> list[str]:
         return [
             motion
-            for dataset_source in self.available_dataset_sources
-            for motion in self.available_motions_in(dataset_source)
+            for dataset_source in self._cached_dataset_sources
+            for motion in self._cached_motions_by_source[dataset_source]
         ]
 
     def available_motions_in(self, dataset_source: str) -> list[str]:
-        dataset_source_group = self.zarr_dataset[dataset_source]
-        assert isinstance(dataset_source_group, zarr.Group)
-        return list(dataset_source_group.keys())
+        return self._cached_motions_by_source[dataset_source]
 
     def available_trajectories_in(self, dataset_source: str, motion: str) -> list[str]:
-        dataset_source_group = self.zarr_dataset[dataset_source]
-        assert isinstance(dataset_source_group, zarr.Group)
-        motion_group = dataset_source_group[motion]
-        assert isinstance(motion_group, zarr.Group)
-        return sorted(list(motion_group.keys()))
+        return self._cached_trajectories_by_motion[(dataset_source, motion)]
 
     @property
     def available_trajectories(self) -> list[str]:
-        return [
-            f"{dataset_source}/{motion}/{trajectory}"
-            for dataset_source in self.available_dataset_sources
-            for motion in self.available_motions_in(dataset_source)
-            for trajectory in self.available_trajectories_in(dataset_source, motion)
-        ]
+        return self._cached_trajectories
 
     def update_references(
         self,
