@@ -49,10 +49,10 @@ class VectorizedTrajectoryDataset(BaseDataset):
         self.buffer_size = getattr(cfg, "buffer_size", 128)
         self.allow_wrap = bool(getattr(cfg, "allow_wrap", False))
 
-        self.env_traj_ids = [-1] * self.num_envs
-        self.env_steps = [0] * self.num_envs
-        self.window_starts = [0] * self.num_envs
-        self.buffers = [{} for _ in range(self.num_envs)]
+        self.env_traj_ids = np.array([-1] * self.num_envs)
+        self.env_steps = np.array([0] * self.num_envs)
+        self.window_starts = np.array([0] * self.num_envs)
+        self.buffers = np.array([{} for _ in range(self.num_envs)])
         self.handlers = {}
         # Gather trajectory lengths and validate key consistency
         self.traj_lengths = []
@@ -70,6 +70,7 @@ class VectorizedTrajectoryDataset(BaseDataset):
             if "qpos" not in group:
                 raise KeyError(f"Trajectory {traj} missing required key 'qpos'")
             self.traj_lengths.append(group["qpos"].shape[0])
+        self.traj_lengths = np.array(self.traj_lengths)
         # Make mypy happy
         if self.all_keys is None:
             self.all_keys = []
