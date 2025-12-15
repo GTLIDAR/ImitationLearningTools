@@ -14,8 +14,8 @@ import torch
 import zarr
 from tensordict import TensorDict
 
-from .replay_memmap import ExpertMemmapBuilder, build_trajectory_td
 from .replay_manager import ExpertReplayManager, ExpertReplaySpec
+from .replay_memmap import ExpertMemmapBuilder, build_trajectory_td
 
 
 def _iter_trajectories(zroot: zarr.Group) -> Iterable[tuple[int, int, zarr.Group]]:
