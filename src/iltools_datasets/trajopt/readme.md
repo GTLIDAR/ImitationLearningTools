@@ -4,17 +4,17 @@ Memory efficient memmap dataset management from trajectory optimizaiton generate
 
 ## Design idea
 
-Goal: stream fixed‑shape windows of trajectory data to jitted training loops without loading whole episodes into device memory.
+Goal: stream fixed-shape windows of trajectory data to jitted training loops without loading whole episodes into device memory.
 
 Key pieces
 - Trajopt → Zarr export: `TrajoptLoader.save(...)` writes a vectorized layout that `VectorizedTrajectoryDataset` can read lazily.
 - Vectorized window fetch: `VectorizedTrajectoryDataset.fetch_window(...)` returns `[num_envs, window_size, ...]` slices using small sliding host buffers.
 - Double buffering to device: `DoubleBufferStreamer` overlaps host prefetch + device_put with device compute.
-- Digit references: `digit_refs.build_refs_from_window(...)` derives Digit‑specific ref arrays (joint targets, root pose/vel, EE) from raw `qpos/qvel` windows (no per‑episode padding).
+- Digit references: `digit_refs.build_refs_from_window(...)` derives Digit-specific ref arrays (joint targets, root pose/vel, EE) from raw `qpos/qvel` windows (no per-episode padding).
 
 Why this minimizes memory
-- Host keeps only small per‑env sliding windows (buffer_size).
-- Device holds only the current double‑buffered window for compute.
+- Host keeps only small per-env sliding windows (buffer_size).
+- Device holds only the current double-buffered window for compute.
 - No Python/Zarr I/O inside jit; shapes are fixed for XLA.
 
 Data layout (Zarr)
@@ -48,7 +48,7 @@ ds.update_references(
 )
 ```
 
-3) Double‑buffer windows to device (JAX)
+3) Double-buffer windows to device (JAX)
 ```python
 from iltools_datasets.jax_stream import DoubleBufferStreamer
 
@@ -99,10 +99,10 @@ def train_step(batch):
 ```
 
 Integration with the Digit environment (mujoco_playground)
-- In `triarm_eetrack.py`, the env reads `cfg.zarr_path`. If provided, it attaches the vectorized dataset and uses a minimal window on `reset` to build per‑episode references.
+- In `triarm_eetrack.py`, the env reads `cfg.zarr_path`. If provided, it attaches the vectorized dataset and uses a minimal window on `reset` to build per-episode references.
 - You can point both `cfg.ref_path` (npz root for fallback) and `cfg.zarr_path` (preferred) in tests or training.
 
 See also
 - Streaming tests: `tests/datasets/test_digit_stream_jit.py`
-- End‑to‑end training‑like test: `tests/training/test_digit_training_streaming.py`
+- End-to-end training-like test: `tests/training/test_digit_training_streaming.py`
 - Vectorized dataset API: `src/iltools_datasets/storage.py`

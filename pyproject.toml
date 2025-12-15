@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "iltools"
-version = "0.3.0"
+version = "0.4.0"
 authors = [{ name = "Feiyang Wu", email = "feiyang.wu@gatech.edu" }]
 description = "Modular toolkit for robot imitation learning"
 readme = "README.md"
@@ -21,18 +21,16 @@ dependencies = [
     "tqdm",
     "gymnasium>=1.2",
     "torch",
-    "tensordict>=0.10",
+    "tensordict",
     "mujoco",
     "mediapy",
     "matplotlib",
     "pytest",
-    
+
 ]
 
 [project.optional-dependencies]
-"loco-mujoco" = [
-    "loco-mujoco",
-]
+"loco-mujoco" = ["loco-mujoco"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

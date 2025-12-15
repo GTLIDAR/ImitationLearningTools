@@ -1,24 +1,23 @@
-from __future__ import annotations
-
-"""High‑level offline dataset and memmap utilities.
+"""High-level offline dataset and memmap utilities.
 
 This module ties together three layers that already exist in the repo:
 
 - `BaseLoader` subclasses (e.g. `LocoMuJoCoLoader`) that know how to talk to
   raw sources and can export a Zarr trajectory store.
-- `VectorizedTrajectoryDataset` that reads those per‑trajectory Zarr layouts in
-  a vectorized, multi‑env friendly way.
+- `VectorizedTrajectoryDataset` that reads those per-trajectory Zarr layouts in
+  a vectorized, multi-env friendly way.
 - The replay stack (`replay_export.py` + `replay_manager.py` +
   `replay_memmap.py`) that turns Zarr trajectories into a TorchRL
   `TensorDictReplayBuffer` backed by `LazyMemmapStorage`.
 
-The goal here is to expose a **clear, end‑to‑end API**:
+The goal here is to expose a **clear, end-to-end API**:
 
-1. Build an offline trajectory dataset on disk (Zarr) from Loco‑MuJoCo.
+1. Build an offline trajectory dataset on disk (Zarr) from Loco-MuJoCo.
 2. Open an existing offline dataset and inspect its trajectories.
-3. Build a memmap‑backed replay buffer from the offline dataset and configure
-   per‑environment (task, trajectory, step) assignments.
+3. Build a memmap-backed replay buffer from the offline dataset and configure
+   per-environment (task, trajectory, step) assignments.
 """
+from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,7 +36,7 @@ from .replay_manager import EnvAssignment, ExpertReplayManager
 
 
 # ---------------------------------------------------------------------------
-# Lightweight index over per‑trajectory Zarr layout
+# Lightweight index over per-trajectory Zarr layout
 # ---------------------------------------------------------------------------
 
 
@@ -49,7 +48,7 @@ class TrajectoryRef:
 
         <zarr_root>/<dataset_source>/<motion>/<trajectory>/<key>
 
-    where each `<key>` is a time‑major array of shape `[T, ...]`.
+    where each `<key>` is a time-major array of shape `[T, ...]`.
     """
 
     dataset_source: str
@@ -64,9 +63,9 @@ class TrajectoryRef:
 
 @dataclass
 class OfflineDataset:
-    """Represents an on‑disk offline trajectory dataset.
+    """Represents an on-disk offline trajectory dataset.
 
-    This is a thin, read‑only façade over:
+    This is a thin, read-only façade over:
 
     - a root directory (for metadata and multiple stores),
     - a trajectories Zarr store (usually `trajectories.zarr`),
@@ -135,7 +134,7 @@ class OfflineDataset:
                             length = int(traj_group[key].shape[0])
                             break
                     if length is None:
-                        # Fallback: use first array‑valued key
+                        # Fallback: use first array-valued key
                         for key in traj_group.keys():
                             arr = traj_group[key]
                             if hasattr(arr, "shape") and len(arr.shape) >= 1:
@@ -212,7 +211,7 @@ class OfflineDataset:
     ) -> tuple[ExpertReplayManager, list[EnvAssignment]]:
         """Build a replay manager and attach a simple sequential env assignment.
 
-        Envs are assigned to trajectories in a round‑robin fashion over the
+        Envs are assigned to trajectories in a round-robin fashion over the
         flattened `(task_id, traj_id)` pairs as produced by
         `build_replay_from_zarr`. The returned `EnvAssignment` list can be
         further modified by the caller and passed back into
@@ -243,7 +242,7 @@ class OfflineDataset:
 
 
 # ---------------------------------------------------------------------------
-# Loco‑MuJoCo specific convenience
+# Loco-MuJoCo specific convenience
 # ---------------------------------------------------------------------------
 
 
@@ -258,9 +257,9 @@ def export_loco_mujoco_offline(
     loader_cls: type[BaseLoader] = LocoMuJoCoLoader,
     **loader_kwargs,
 ) -> OfflineDataset:
-    """End‑to‑end helper: build an offline dataset from Loco‑MuJoCo.
+    """End-to-end helper: build an offline dataset from Loco-MuJoCo.
 
-    High‑level usage:
+    High-level usage:
 
     - Call this once (offline) to write a Zarr store and metadata:
 
@@ -290,7 +289,7 @@ def export_loco_mujoco_offline(
         with meta_path.open("w") as f:
             json.dump(meta.model_dump(), f, indent=2)
     except Exception:
-        # Metadata is best‑effort; failures here should not break export.
+        # Metadata is best-effort; failures here should not break export.
         pass
 
     return OfflineDataset.from_zarr_root(
@@ -298,5 +297,3 @@ def export_loco_mujoco_offline(
         zarr_name=zarr_name,
         metadata_filename=metadata_filename,
     )
-
-

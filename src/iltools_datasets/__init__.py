@@ -13,7 +13,6 @@ except Exception:  # pragma: no cover
             )
 
 
-from .storage import VectorizedTrajectoryDataset
 from .replay_memmap import (
     Segment,
     ExpertMemmapBuilder,
@@ -26,6 +25,7 @@ from .replay_manager import (
     ExpertReplayManager,
     ExpertReplaySpec,
 )
+from .reference import JointMapping, ReferenceManager
 from .replay_export import build_replay_from_zarr
 import logging
 
@@ -34,7 +34,6 @@ __all__ = [
     "BaseDataset",
     "BaseLoader",
     "LocoMuJoCoLoader",
-    "VectorizedTrajectoryDataset",
     "Segment",
     "ExpertMemmapBuilder",
     "build_trajectory_td",
@@ -43,5 +42,7 @@ __all__ = [
     "EnvAssignment",
     "ExpertReplayManager",
     "ExpertReplaySpec",
+    "JointMapping",
+    "ReferenceManager",
     "build_replay_from_zarr",
 ]

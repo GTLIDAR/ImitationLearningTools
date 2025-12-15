@@ -311,6 +311,10 @@ class ExpertReplayManager:
         )
 
         self._segments = segments
+        # Fast lookup from (task_id, traj_id) to Segment for trajectory-style access
+        self._seg_by_key: dict[tuple[int, int], Segment] = {
+            (s.task_id, s.traj_id): s for s in self._segments
+        }
         self._transforms: list[Any] = []
 
         if spec.device != "cpu":
@@ -494,6 +498,71 @@ class ExpertReplayManager:
         )
         # Preserve any transforms that were previously applied
         self._restore_transforms()
+
+    # ------------------------------------------------------------------
+    # Trajectory-style helpers
+    # ------------------------------------------------------------------
+
+    def sample_per_env_window(
+        self,
+        window_size: int,
+        *,
+        wrap: bool = True,
+    ) -> TensorDict:
+        """Return a fixed-length window [num_envs, window_size, ...] per env.
+
+        This uses the current `EnvAssignment` to interpret each environment as
+        following a particular (task_id, traj_id) trajectory at a local `step`.
+        For env `e` with assignment `(task_id, traj_id, step)`, we gather
+        indices corresponding to:
+
+            step, step+1, ..., step+window_size-1
+
+        inside the associated `Segment`. When `wrap=True` indices are wrapped
+        modulo the segment length; otherwise an out-of-range access raises.
+
+        Note:
+          - This method does **not** advance the per-env step pointers. Use
+            `update_env_assignment` / `update_assignments` to move the cursor,
+            or rely on `SequentialPerEnvSampler` via `buffer.sample()` for
+            single-step sequential access.
+        """
+        if self._assignment is None:
+            raise RuntimeError(
+                "No assignment set. Call set_assignment([...]) before "
+                "requesting per-env windows."
+            )
+
+        num_envs = len(self._assignment)
+        ws = int(window_size)
+        if ws <= 0:
+            raise ValueError("window_size must be positive")
+
+        # Build [num_envs, window_size] index tensor
+        idx = torch.empty((num_envs, ws), dtype=torch.int64)
+        for env_idx, a in enumerate(self._assignment):
+            seg = self._seg_by_key.get((a.task_id, a.traj_id))
+            if seg is None:
+                raise KeyError(
+                    f"No segment found for (task_id={a.task_id}, traj_id={a.traj_id})"
+                )
+            for dt in range(ws):
+                local_t = a.step + dt
+                if wrap:
+                    idx[env_idx, dt] = seg.index_at(local_t, wrap=True)
+                else:
+                    idx[env_idx, dt] = seg.index_at(local_t, wrap=False)
+
+        flat_idx = idx.reshape(-1)
+        td = self.buffer._storage[flat_idx]
+        # Reshape to [num_envs, window_size, ...]
+        td = td.view(num_envs, ws)
+
+        # Apply any transforms that were registered on the buffer
+        for transform in self._transforms:
+            td = transform(td)  # type: ignore[arg-type]
+
+        return td
 
     def set_custom_sampler(self, sampler: Sampler, *, batch_size: int) -> None:
         """Attach any TorchRL sampler (e.g., weighted) for flexible minibatching."""

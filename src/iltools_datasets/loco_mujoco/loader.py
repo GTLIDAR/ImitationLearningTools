@@ -19,7 +19,6 @@ from iltools_datasets.base_loader import (
     BaseDataset,
     BaseLoader,
 )
-from iltools_datasets.storage import VectorizedTrajectoryDataset
 
 
 class LocoMuJoCoLoader(BaseLoader):
@@ -144,7 +143,12 @@ class LocoMuJoCoLoader(BaseLoader):
         return None
 
     def as_dataset(self, **kwargs) -> BaseDataset:
-        return VectorizedTrajectoryDataset(self, **kwargs)  # type: ignore
+        raise NotImplementedError(
+            "LocoMuJoCoLoader.as_dataset is no longer supported. "
+            "Export trajectories to Zarr via `save(...)` and build a replay "
+            "buffer using `iltools_datasets.offline.OfflineDataset` and "
+            "`build_replay_from_zarr` instead."
+        )
 
     def save(self, path: str, **kwargs) -> None:
         """

@@ -222,6 +222,54 @@ def build_replay_from_zarr(
                 td.set("terminated", term_tensor)
             if trunc_tensor is not None:
                 td.set("truncated", trunc_tensor)
+
+        # ------------------------------------------------------------------
+        # Attach all remaining per-state arrays as (k, ('next', k)) pairs.
+        #
+        # Any Zarr dataset under this trajectory group with leading dimension
+        # equal to `T` and not already handled above is treated as a per-state
+        # signal. We export:
+        #
+        #   td[k]           = value[:-1]
+        #   td[('next', k)] = value[1:]
+        #
+        # Arrays with different leading lengths (e.g. per-transition flags
+        # that are already handled via `terminated`/`truncated`) are skipped.
+        # ------------------------------------------------------------------
+        special_keys = set(obs_keys) | {
+            act_key_eff,
+            "terminated",
+            "done",
+            "truncated",
+            "absorbing",
+        }
+
+        for k in traj_group.keys():
+            if k in special_keys:
+                continue
+            node = traj_group[k]
+            # Skip non-array leaves (e.g. groups or scalars)
+            if not hasattr(node, "shape"):
+                continue
+            arr = np.asarray(node)
+            # Only treat arrays with leading dimension T as per-state
+            if arr.ndim == 0 or arr.shape[0] != T:
+                continue
+            curr_np = arr[:-1]
+            next_np = arr[1:]
+
+            if arr.dtype == np.bool_ or np.issubdtype(arr.dtype, np.bool_):
+                curr = torch.from_numpy(curr_np.astype(np.bool_))
+                nxt = torch.from_numpy(next_np.astype(np.bool_))
+            else:
+                curr = torch.from_numpy(curr_np).to(torch.float32)
+                nxt = torch.from_numpy(next_np).to(torch.float32)
+
+            # Avoid accidentally overwriting anything we have already set
+            if k not in td.keys():
+                td.set(k, curr)
+            if ("next", k) not in td.keys(True):
+                td.set(("next", k), nxt)
         print(f"[build_replay_from_zarr] td: {td}")
         # Append to builder and record in tasks
         builder.add_trajectory(task_id=task_id, traj_id=traj_id, transitions=td)

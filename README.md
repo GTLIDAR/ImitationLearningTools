@@ -21,12 +21,12 @@ We recommend using the `conda-forge` channel for managing dependencies. For a fa
 
 3.  **Install the project:**
 
-    Base install (without Loco‑MuJoCo):
+    Base install (without Loco-MuJoCo):
     ```bash
     uv pip install -e .
     ```
 
-    If you need Loco‑MuJoCo support (dataset loader, tests, viewers), install the optional extra:
+    If you need Loco-MuJoCo support (dataset loader, tests, viewers), install the optional extra:
     ```bash
     uv pip install -e .[loco-mujoco]
     ```
