@@ -1,4 +1,8 @@
+from __future__ import annotations
+
 import os
+import tempfile
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -10,127 +14,367 @@ from loco_mujoco.task_factories import (
     ImitationFactory,
     LAFAN1DatasetConf,
 )
-from loco_mujoco.trajectory.handler import TrajectoryHandler
 from omegaconf import DictConfig
 from zarr.storage import LocalStore
 
 from iltools_core.metadata_schema import DatasetMeta
-from iltools_datasets.base_loader import (
-    BaseDataset,
-    BaseLoader,
+from iltools_datasets.base_loader import BaseLoader
+
+# Type aliases for improved readability
+MotionEntry = dict[str, Any]
+TrajectoryEntry = dict[str, Any]
+MotionIndex = dict[str, dict[str, dict[str, Any]]]
+
+# Supported trajectory data keys for export
+TRAJECTORY_DATA_KEYS: frozenset[str] = frozenset(
+    ["qpos", "qvel", "xpos", "xquat", "cvel", "subtree_com", "site_xpos", "site_xmat"]
 )
+
+
+@dataclass(frozen=True)
+class TrajectoryInfo:
+    """Immutable container for trajectory slice information."""
+
+    dataset: str
+    motion: str
+    motion_name: str
+    trajectory_index: int
+    trajectory_in_motion: int
+    start: int
+    end: int
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
+
+    def to_dict(self) -> TrajectoryEntry:
+        return {
+            "dataset": self.dataset,
+            "motion": self.motion,
+            "motion_name": self.motion_name,
+            "trajectory_index": self.trajectory_index,
+            "trajectory_in_motion": self.trajectory_in_motion,
+            "start": self.start,
+            "end": self.end,
+            "length": self.length,
+        }
 
 
 class LocoMuJoCoLoader(BaseLoader):
     """
     Flexible loader for Loco-MuJoCo trajectories.
-    Now supports multiple datasets/motions (default, lafan1, amass).
+    Supports multiple datasets/motions (default, lafan1, amass).
 
-    The desired control dt is computed and set through num_substeps when initializing the environment.
+    The desired control dt is computed and set through num_substeps when
+    initializing the environment.
     """
 
     def __init__(
         self,
         env_name: str,
         cfg: DictConfig,
-        **kwargs,
-    ):
-        """cfg can from conf/ or from Isaaclab dataclass"""
-        print("[LocoMuJoCoLoader] Initializing LocoMuJoCoLoader")
+        build_zarr_dataset: bool = True,
+        zarr_path: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Initialize the LocoMuJoCoLoader.
+
+        Args:
+            env_name: Name of the Loco-MuJoCo environment (e.g., "UnitreeG1").
+            cfg: Configuration containing dataset trajectories and control parameters.
+            build_zarr_dataset: If True, save trajectories to Zarr store during initialization.
+            zarr_path: Directory path for the Zarr store (required if build_zarr_dataset is True).
+            **kwargs: Additional keyword arguments passed to _discover_and_save_trajectories.
+        """
+        super().__init__()
+        self.logger.info("Initializing LocoMuJoCoLoader")
         self.cfg = cfg
         self.env_name = env_name
-        self.dataset_dict = cfg.dataset.get(
+        self.dataset_dict: dict[str, list[str | dict[str, str]]] = cfg.dataset.get(
             "trajectories", {"default": ["walk"], "amass": [], "lafan1": []}
         )
-        print("[LocoMuJoCoLoader] Dataset dictionary:", self.dataset_dict)
+        self.logger.info("Dataset dictionary: %s", self.dataset_dict)
 
-        # self._setup_cache()
-
-        self.env: LocoEnv = self._load_env(**kwargs)
-        assert hasattr(self.env, "th") and isinstance(
-            self.env.th, TrajectoryHandler
-        ), "TrajectoryHandler not found in env"
-
-        # Store original frequency info
-        self.original_freq = self.env.th.traj.info.frequency
-        self.effective_freq = getattr(self.cfg, "control_freq", self.original_freq)
-
-        self._metadata = self._discover_metadata()
-
-    def _setup_cache(self):
-        cache_path = os.path.expanduser("~/.loco-mujoco-caches")
-        if not os.path.exists(cache_path):
-            os.makedirs(cache_path)
-        os.environ["LOCO_MUJOCO_CACHE"] = cache_path
-
-    def _load_env(self, **kwargs):
-        # Only create confs if the list is non-empty, otherwise set to None
-        default_conf = (
-            DefaultDatasetConf(self.dataset_dict["default"])
-            if self.dataset_dict["default"]
-            else None
-        )
-        lafan1_conf = (
-            LAFAN1DatasetConf(self.dataset_dict["lafan1"])
-            if self.dataset_dict["lafan1"]
-            else None
-        )
-        amass_conf = (
-            AMASSDatasetConf(self.dataset_dict["amass"])
-            if self.dataset_dict["amass"]
-            else None
-        )
-        env = ImitationFactory.make(
-            self.env_name,
-            default_dataset_conf=default_conf,  # type: ignore
-            lafan1_dataset_conf=lafan1_conf,  # type: ignore
-            amass_dataset_conf=amass_conf,  # type: ignore
+        self._setup_cache()
+        self.env_info = {}
+        self._trajectory_info_list, self._motion_info_dict = self._get_trajectories(
+            build_zarr_dataset=build_zarr_dataset,
+            path=zarr_path,
             **kwargs,
         )
+        self._metadata = self._discover_metadata()
 
-        self.num_traj = len(env.th.traj.data.split_points) - 1  # type: ignore
+    @property
+    def num_traj(self) -> int:
+        """Number of trajectories across all motions."""
+        return len(self._trajectory_info_list)
 
-        self.split_points = env.th.traj.data.split_points  # type: ignore
+    def _setup_cache(self) -> None:
+        """Configure the Loco-MuJoCo cache directory."""
+        cache_path = os.path.join(tempfile.gettempdir(), "loco-mujoco-caches")
+        os.makedirs(cache_path, exist_ok=True)
+        os.environ["LOCO_MUJOCO_CACHE"] = cache_path
 
-        return env
+    def _collect_motion_entries(self) -> list[MotionEntry]:
+        """
+        Collect all configured motions across dataset types.
+
+        Returns:
+            List of motion entries with dataset type, motion name, and combined name.
+
+        Raises:
+            ValueError: If a motion dict is missing the 'name' field.
+        """
+        motions: list[MotionEntry] = []
+        for dataset_type, motion_list in self.dataset_dict.items():
+            if not motion_list:
+                continue
+            for motion in motion_list:
+                # Extract motion name from string or dict specification
+                if isinstance(motion, dict):
+                    name = motion.get("name")
+                    if name is None:
+                        raise ValueError(
+                            f"Motion spec in {dataset_type} requires a 'name' field."
+                        )
+                    motion_name = name
+                else:
+                    motion_name = motion
+
+                motions.append(
+                    {
+                        "dataset": dataset_type,
+                        "motion": motion_name,
+                        "motion_name": f"{dataset_type}_{motion_name}",
+                    }
+                )
+        return motions
+
+    def _load_env_for_motion(self, dataset_type: str, motion: str) -> LocoEnv:
+        """
+        Load a Loco-MuJoCo environment for a specific motion.
+
+        Args:
+            dataset_type: One of "default", "lafan1", or "amass".
+            motion: The motion/task name within the dataset.
+
+        Returns:
+            Configured LocoEnv instance.
+
+        Raises:
+            ValueError: If dataset_type is not recognized.
+        """
+        factory_configs = {
+            "default": lambda m: {"default_dataset_conf": DefaultDatasetConf(task=m)},
+            "lafan1": lambda m: {
+                "lafan1_dataset_conf": LAFAN1DatasetConf(dataset_name=m)
+            },
+            "amass": lambda m: {
+                "amass_dataset_conf": AMASSDatasetConf(rel_dataset_path=m)
+            },
+        }
+        if dataset_type not in factory_configs:
+            raise ValueError(f"Unknown dataset type: {dataset_type}")
+
+        return ImitationFactory.make(
+            self.env_name, **factory_configs[dataset_type](motion)
+        )
+
+    def _get_trajectories(
+        self,
+        build_zarr_dataset: bool = False,
+        path: str | None = None,
+        **kwargs: Any,
+    ) -> tuple[list[TrajectoryEntry], MotionIndex]:
+        """
+        Discover trajectory and motion metadata, and optionally save to Zarr.
+
+        This function iterates through all configured motions, builds trajectory and motion
+        manifests, and if build_zarr_dataset is True, saves the trajectory data to a Zarr store.
+
+        Args:
+            build_zarr_dataset: If True, save trajectories to Zarr store at path.
+            path: Directory path for the Zarr store (required if build_zarr_dataset is True).
+            **kwargs: Optional parameters for Zarr saving:
+                - chunk_size (int): Chunk size for Zarr arrays (default: 10).
+                - shard_size (int): Shard size for Zarr arrays (default: 100).
+                - export_transitions (bool): Export obs/action transitions (default: False).
+                - obs_key_name (str): Key name for observations (default: "obs").
+                - next_obs_key_name (str): Key name for next observations (default: "next_obs").
+                - action_key_name (str): Key name for actions (default: "action").
+
+        Returns:
+            Tuple of (trajectory_info_list, motion_info_dict).
+            Trajectory info list is a list of dictionaries, each containing the information about a trajectory.
+            Motion manifest is a dictionary of dictionaries, each containing the information about a motion.
+
+        Raises:
+            ValueError: If build_zarr_dataset is True but path is None.
+        """
+        if build_zarr_dataset and path is None:
+            raise ValueError("path must be provided when build_zarr_dataset is True")
+
+        trajectory_info_list: list[TrajectoryEntry] = []
+        motion_info_dict: MotionIndex = {}
+        global_idx = 0
+
+        # Initialize Zarr store if needed
+        locomujoco_group: zarr.Group | None = None
+        if build_zarr_dataset:
+            chunk_size: int = kwargs.get("chunk_size", 10)
+            shard_size: int = kwargs.get("shard_size", 100)
+            os.makedirs(path, exist_ok=True)
+            store = LocalStore(path)
+            root = zarr.group(store=store, overwrite=False)
+            locomujoco_group = root.create_group("loco_mujoco")
+
+        motion_metadata: dict[str, dict[str, Any]] = {}
+
+        for entry in self._collect_motion_entries():
+            # Note that each motion can have multiple trajectories, each with a different start and end index.
+            env = self._load_env_for_motion(entry["dataset"], entry["motion"])
+            if not self.env_info:
+                # Store the environment information only once.
+                self.env_info = {
+                    "joint_names": env.th.traj.info.joint_names,
+                    "body_names": env.th.traj.info.body_names,
+                    "site_names": env.th.traj.info.site_names,
+                }
+                self.logger.info("Environment information: %s", self.env_info)
+            split_points = env.th.traj.data.split_points
+            num_traj = len(split_points) - 1
+            motion_name = entry["motion_name"]
+
+            motion_entry = motion_info_dict.setdefault(entry["dataset"], {}).setdefault(
+                entry["motion"],
+                {
+                    "motion_name": motion_name,
+                    "trajectory_indices": [],
+                    "trajectory_lengths": [],
+                    "trajectory_local_start_indices": [],
+                    "trajectory_local_end_indices": [],
+                },
+            )
+
+            # Create motion group in Zarr if saving
+            motion_group: zarr.Group | None = None
+            if build_zarr_dataset and locomujoco_group is not None:
+                motion_group = locomujoco_group.create_group(motion_name)
+                motion_group.attrs["num_trajectories"] = num_traj
+
+            # Iterate over each trajectory in the motion.
+            for local_idx in range(num_traj):
+                traj_start = int(split_points[local_idx])
+                traj_end = int(split_points[local_idx + 1])
+                traj_len = traj_end - traj_start
+
+                traj_info = TrajectoryInfo(
+                    dataset=entry["dataset"],
+                    motion=entry["motion"],
+                    motion_name=motion_name,
+                    trajectory_index=global_idx,
+                    trajectory_in_motion=local_idx,
+                    start=traj_start,
+                    end=traj_end,
+                )
+
+                # Add to trajectory manifest, motion manifest, and global index
+                # Also store the local start and end indices for the trajectory, i.e., the indices within the motion.
+                trajectory_info_list.append(traj_info.to_dict())
+                motion_entry["trajectory_indices"].append(global_idx)
+                motion_entry["trajectory_lengths"].append(traj_info.length)
+                motion_entry["trajectory_local_start_indices"].append(traj_start)
+                motion_entry["trajectory_local_end_indices"].append(traj_end)
+
+                # Save trajectory data to Zarr if requested
+                if build_zarr_dataset and motion_group is not None:
+                    traj_group = motion_group.create_group(f"trajectory_{local_idx}")
+                    self._save_trajectory_data(
+                        traj_group,
+                        env,
+                        traj_start,
+                        traj_end,
+                        chunk_size,
+                        shard_size,
+                    )
+
+                    if kwargs.get("export_transitions", False):
+                        self._save_transitions(
+                            traj_group,
+                            env,
+                            split_points,
+                            local_idx,
+                            traj_len,
+                            **kwargs,
+                        )
+
+                global_idx += 1
+
+            # Update motion group attributes if saving
+            if build_zarr_dataset and motion_group is not None:
+                motion_group.attrs["trajectory_lengths"] = motion_entry[
+                    "trajectory_lengths"
+                ]
+                motion_metadata[motion_name] = {
+                    "num_trajectories": num_traj,
+                    "trajectory_lengths": motion_entry["trajectory_lengths"],
+                }
+
+        # Finalize Zarr store attributes if saving
+        if build_zarr_dataset and locomujoco_group is not None:
+            dt = self.control_dt
+            locomujoco_group.attrs["num_trajectories"] = len(trajectory_info_list)
+            locomujoco_group.attrs["trajectory_lengths"] = [
+                e["length"] for e in trajectory_info_list
+            ]
+            locomujoco_group.attrs["joint_names"] = self.env_info["joint_names"]
+            locomujoco_group.attrs["body_names"] = self.env_info["body_names"]
+            locomujoco_group.attrs["site_names"] = self.env_info["site_names"]
+            locomujoco_group.attrs["keys"] = list(TRAJECTORY_DATA_KEYS)
+            locomujoco_group.attrs["dt"] = dt
+            locomujoco_group.attrs["motion_metadata"] = motion_metadata
+            locomujoco_group.attrs["trajectory_info_list"] = trajectory_info_list
+            locomujoco_group.attrs["motion_info_dict"] = motion_info_dict
+
+        self.logger.info(
+            "Built trajectory manifest with %d entries across %d motions",
+            len(trajectory_info_list),
+            sum(len(m) for m in motion_info_dict.values()),
+        )
+        if build_zarr_dataset:
+            self.logger.info("Saved trajectories to Zarr store at %s", path)
+
+        return trajectory_info_list, motion_info_dict
 
     def _discover_metadata(self) -> DatasetMeta:
-        """
-        TODO: this is useless for now.
-        """
-        traj_info: dict[str, Any] = self.env.th.traj.info.to_dict()  # type: ignore
-
-        traj_data_keys = [
-            "qpos",
-            "qvel",
-            "xpos",
-            "xquat",
-            "cvel",
-            "subtree_com",
-            "site_xpos",
-            "site_xmat",
-        ]
-
-        traj_data_lengths: list[int] = [
-            self.env.th.traj.data.split_points[i + 1]  # type: ignore
-            - self.env.th.traj.data.split_points[i]  # type: ignore
-            for i in range(len(self.env.th.traj.data.split_points) - 1)  # type: ignore
-        ]  # type: ignore
+        """Build dataset metadata from the trajectory manifest."""
+        traj_lengths = [int(e["length"]) for e in self._trajectory_info_list]
+        dt = self.control_dt
 
         return DatasetMeta(
             name="loco_mujoco",
             source="loco_mujoco",
             version="1.0.1",
-            citation="TODO",
-            num_trajectories=self.env.th.n_trajectories,  # type: ignore
-            keys=traj_data_keys,
-            trajectory_lengths=traj_data_lengths,
-            dt=1.0 / traj_info["frequency"],
-            joint_names=traj_info["joint_names"],
-            body_names=traj_info["body_names"],
-            site_names=traj_info["site_names"],
-            metadata=traj_info["metadata"],
+            citation="LocoMuJoCo: A Comprehensive Imitation Learning Benchmark for Locomotion",
+            num_trajectories=len(self._trajectory_info_list),
+            keys=list(TRAJECTORY_DATA_KEYS),
+            trajectory_lengths=traj_lengths,
+            dt=dt,
+            joint_names=self.env_info["joint_names"],
+            body_names=self.env_info["body_names"],
+            site_names=self.env_info["site_names"],
+            metadata={
+                "trajectory_info_list": self._trajectory_info_list,
+                "motion_info_dict": self._motion_info_dict,
+            },
         )
+
+    @property
+    def control_dt(self) -> float:
+        """Compute control timestep from configuration."""
+        control_freq = getattr(self.cfg, "control_freq", None)
+        return 1.0 / control_freq if control_freq else 0.0
 
     @property
     def metadata(self) -> DatasetMeta:
@@ -139,224 +383,132 @@ class LocoMuJoCoLoader(BaseLoader):
     def __len__(self) -> int:
         return self.num_traj
 
-    def __getitem__(self, idx: int) -> None:
-        return None
+    @property
+    def trajectory_info_list(self) -> list[TrajectoryEntry]:
+        """Return the trajectory manifest as a list."""
+        return list(self._trajectory_info_list)
 
-    def as_dataset(self, **kwargs) -> BaseDataset:
-        raise NotImplementedError(
-            "LocoMuJoCoLoader.as_dataset is no longer supported. "
-            "Export trajectories to Zarr via `save(...)` and build a replay "
-            "buffer using `iltools_datasets.offline.OfflineDataset` and "
-            "`build_replay_from_zarr` instead."
+    @property
+    def motion_info_dict(self) -> MotionIndex:
+        """Return the motion manifest as a dictionary."""
+        return dict(self._motion_info_dict)
+
+    def _save_trajectory_data(
+        self,
+        traj_group: zarr.Group,
+        env: LocoEnv,
+        traj_start: int,
+        traj_end: int,
+        chunk_size: int,
+        shard_size: int,
+    ) -> None:
+        """Save trajectory state data (qpos, qvel, etc.) to Zarr."""
+        traj_dict = env.th.traj.to_dict()
+        for key, value in traj_dict.items():
+            # Check if trajectory data entry should be exported
+            if value is None or isinstance(value, (list, int, float)):
+                continue
+            if key not in TRAJECTORY_DATA_KEYS:
+                continue
+
+            sliced = np.asarray(value[traj_start:traj_end])
+            chunks = [chunk_size] + list(sliced.shape[1:])
+            shards = [shard_size] + list(sliced.shape[1:])
+            dataset = traj_group.create_dataset(
+                key,
+                shape=sliced.shape,
+                dtype=sliced.dtype,
+                chunks=chunks,
+                shards=shards,
+            )
+            dataset[:] = sliced
+
+    def _save_transitions(
+        self,
+        traj_group: zarr.Group,
+        env: LocoEnv,
+        split_points: np.ndarray,
+        local_idx: int,
+        traj_len: int,
+        **kwargs: Any,
+    ) -> None:
+        """Save transition data (obs, action, next_obs) to Zarr."""
+        obs_key = kwargs.get("obs_key_name", "obs")
+        next_obs_key = kwargs.get("next_obs_key_name", "next_obs")
+        action_key = kwargs.get("action_key_name", "action")
+
+        transitions = env.th.traj.transitions or env.create_dataset()
+        obs, next_obs, actions, absorbings, dones = self._extract_transitions(
+            transitions
         )
 
-    def save(self, path: str, **kwargs) -> None:
-        """
-        Saves the dataset to a directory. The dataset format is a Zarr store.
-        The structure is as follows:
-        Dataset/
-        ├── motion1/  # e.g., default_walk
-        │   ├── trajectory_0/
-        │   │   ├── qpos/
-        │   │   ├── qvel/
-        │   │   ├── xpos/
-        │   │   ├── xquat/
-        │   │   ├── cvel/
-        │   │   ├── subtree_com/
-        │   │   ├── site_xpos/
-        │   │   ├── site_xmat/
-        │   ├── trajectory_1/
-        │   └── ...
-        └── ...
+        # Calculate offset into flattened transition array
+        prev_transitions = sum(
+            max(0, int(split_points[k + 1] - split_points[k]) - 1)
+            for k in range(local_idx)
+        )
 
-        However, the loco-mujoco dataset only assigns one trajectory to each motion.
+        n_transitions = max(0, traj_len - 1)
+        if n_transitions <= 0:
+            return
 
-        Transition export (optional):
-          If `export_transitions=True` is passed via kwargs, this method will attempt
-          to export per-step transition tuples (obs, action, next_obs) using the
-          environment's observation function and the controller actions recorded
-          by Loco-MuJoCo. The arrays will be saved under keys provided by
-          `obs_key_name` (default: 'obs') and `action_key_name` (default: 'action').
+        slice_range = slice(prev_transitions, prev_transitions + n_transitions)
 
-          Notes:
-            - This requires Loco-MuJoCo to expose the necessary APIs to reconstruct
-              observations and actions for each step. If unavailable, a
-              NotImplementedError is raised.
-            - The Zarr → Replay pipeline in `replay_export.py` will pick up these
-              keys automatically and include an additional `lmj_observation` view
-              in the replay TensorDicts.
-        """
+        self._create_transition_dataset(traj_group, obs_key, obs[slice_range])
+        self._create_transition_dataset(traj_group, next_obs_key, next_obs[slice_range])
 
-        chunk_size: int = kwargs.get("chunk_size", 10)
-        shard_size: int = kwargs.get("shard_size", 100)
-        if not os.path.exists(path):
-            os.makedirs(path)
-        store = LocalStore(path)
-        root = zarr.group(store=store, overwrite=False)
-        locomujoco_group = root.create_group("loco_mujoco")
+        if actions is not None:
+            self._create_transition_dataset(
+                traj_group, action_key, actions[slice_range]
+            )
+        if absorbings is not None:
+            self._create_transition_dataset(
+                traj_group, "absorbing", absorbings[slice_range]
+            )
+        if dones is not None:
+            self._create_transition_dataset(traj_group, "done", dones[slice_range])
 
-        # Need groupings because trajectories are in flat order in loco-mujoco, rather than grouped by dataset type
-        groupings: list[str] = []
-        for dataset_type, motions in self.dataset_dict.items():
-            if not motions:
-                continue
-            for motion in motions:
-                trajectory_name = f"{dataset_type}_{motion}"
-                groupings.append(trajectory_name)
+    def _extract_transitions(
+        self, transitions: Any
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+    ]:
+        """Extract transition arrays from the transitions object."""
+        try:
+            obs = np.asarray(transitions.observations)
+            next_obs = np.asarray(transitions.next_observations)
+            actions = self._to_optional_array(transitions.actions)
+            absorbings = self._to_optional_array(transitions.absorbings)
+            dones = self._to_optional_array(transitions.dones)
+        except Exception:
+            try:
+                np_trans = transitions.to_np()
+                obs = np_trans.observations
+                next_obs = np_trans.next_observations
+                actions = self._to_optional_array(np_trans.actions)
+                absorbings = self._to_optional_array(np_trans.absorbings)
+                dones = self._to_optional_array(np_trans.dones)
+            except Exception as e:
+                raise RuntimeError(
+                    "Failed to convert transitions to numpy arrays"
+                ) from e
 
-        # Save info, which is the same for all trajectories
-        traj_info: dict[str, Any] = self.env.th.traj.info.to_dict()  # type: ignore
-        for key, value in traj_info.items():
-            if key in ["model", "metadata"]:
-                continue
-            locomujoco_group.attrs[key] = value
+        return obs, next_obs, actions, absorbings, dones
 
-        # Save trajectories
-        for idx, trajectory_name in enumerate(groupings):
-            motion_group = locomujoco_group.create_group(trajectory_name)
-            # only one trajectory per motion
-            # TODO: consider splitting into multiple trajectories per motion
-            trajectory_group = motion_group.create_group("trajectory_0")
-            traj_start = self.env.th.traj.data.split_points[idx]  # type: ignore
-            traj_end = self.env.th.traj.data.split_points[idx + 1]  # type: ignore
+    def _to_optional_array(self, arr: Any) -> np.ndarray | None:
+        """Convert to numpy array if non-empty, otherwise return None."""
+        if arr is None:
+            return None
+        arr = np.asarray(arr)
+        return arr if arr.size > 0 else None
 
-            for key, value in self.env.th.traj.to_dict().items():  # type: ignore
-                if (
-                    value is None
-                    or isinstance(value, list)
-                    or isinstance(value, int)
-                    or isinstance(value, float)
-                    or key
-                    not in [
-                        "qpos",
-                        "qvel",
-                        "xpos",
-                        "xquat",
-                        "cvel",
-                        "subtree_com",
-                        "site_xpos",
-                        "site_xmat",
-                    ]
-                ):
-                    continue
-                # create chunked array
-                sliced_value = np.array(value[traj_start:traj_end])
-                chunks: list[int] = [chunk_size] + list(sliced_value.shape[1:])
-                shards: list[int] = [shard_size] + list(sliced_value.shape[1:])
-                trajectory_data = trajectory_group.create_dataset(
-                    key,
-                    shape=sliced_value.shape,
-                    dtype=sliced_value.dtype,
-                    chunks=chunks,
-                    shards=shards,
-                )
-                trajectory_data[:] = sliced_value
-
-            # Optionally export (obs, action, next_obs) per-step transitions
-            if kwargs.get("export_transitions", False):
-                obs_key_name = kwargs.get("obs_key_name", "obs")
-                next_obs_key_name = kwargs.get("next_obs_key_name", "next_obs")
-                action_key_name = kwargs.get("action_key_name", "action")
-
-                # Ensure transitions are available; if not, create them
-                transitions = self.env.th.traj.transitions  # type: ignore
-                if transitions is None:
-                    transitions = self.env.create_dataset()
-
-                # Convert to numpy if needed
-                try:
-                    observations = np.asarray(transitions.observations)
-                    next_observations = np.asarray(transitions.next_observations)
-                    actions = (
-                        np.asarray(transitions.actions)
-                        if transitions.actions.size > 0
-                        else None
-                    )
-                    absorbings = (
-                        np.asarray(transitions.absorbings)
-                        if transitions.absorbings.size > 0
-                        else None
-                    )
-                    dones = (
-                        np.asarray(transitions.dones)
-                        if transitions.dones.size > 0
-                        else None
-                    )
-                except Exception:
-                    # transitions may be jax arrays; convert via provided helpers
-                    try:
-                        observations = transitions.to_np().observations  # type: ignore
-                        next_observations = transitions.to_np().next_observations  # type: ignore
-                        actions = transitions.to_np().actions if transitions.actions.size > 0 else None  # type: ignore
-                        absorbings = transitions.to_np().absorbings if transitions.absorbings.size > 0 else None  # type: ignore
-                        dones = transitions.to_np().dones if transitions.dones.size > 0 else None  # type: ignore
-                    except Exception as e:  # pragma: no cover - unexpected type
-                        raise RuntimeError(
-                            "Failed to convert transitions to numpy arrays"
-                        ) from e
-
-                # Slice out this trajectory's segment: number of transitions is (traj_len-1)
-                traj_len = traj_end - traj_start
-                # Compute offset as sum_{k < idx} (len_k - 1). We accumulate on the fly.
-                if idx == 0:
-                    prev_transitions = 0
-                else:
-                    # Recompute prior transitions from split_points for robustness
-                    prev_transitions = 0
-                    for k in range(idx):
-                        s = self.env.th.traj.data.split_points[k]  # type: ignore
-                        e = self.env.th.traj.data.split_points[k + 1]  # type: ignore
-                        prev_transitions += max(0, int(e - s) - 1)
-
-                n_this = max(0, int(traj_len) - 1)
-                if n_this <= 0:
-                    continue
-
-                obs_slice = observations[prev_transitions : prev_transitions + n_this]
-                next_obs_slice = next_observations[
-                    prev_transitions : prev_transitions + n_this
-                ]
-                actions_slice = (
-                    None
-                    if actions is None
-                    else actions[prev_transitions : prev_transitions + n_this]
-                )
-                absorb_slice = (
-                    None
-                    if absorbings is None
-                    else absorbings[prev_transitions : prev_transitions + n_this]
-                )
-                dones_slice = (
-                    None
-                    if dones is None
-                    else dones[prev_transitions : prev_transitions + n_this]
-                )
-
-                # Write to Zarr under trajectory group
-                traj_obs = trajectory_group.create_dataset(
-                    obs_key_name, shape=obs_slice.shape, dtype=obs_slice.dtype
-                )
-                traj_obs[:] = obs_slice
-                traj_next_obs = trajectory_group.create_dataset(
-                    next_obs_key_name,
-                    shape=next_obs_slice.shape,
-                    dtype=next_obs_slice.dtype,
-                )
-                traj_next_obs[:] = next_obs_slice
-                if actions_slice is not None:
-                    traj_act = trajectory_group.create_dataset(
-                        action_key_name,
-                        shape=actions_slice.shape,
-                        dtype=actions_slice.dtype,
-                    )
-                    traj_act[:] = actions_slice
-                if absorb_slice is not None:
-                    traj_abs = trajectory_group.create_dataset(
-                        "absorbing", shape=absorb_slice.shape, dtype=absorb_slice.dtype
-                    )
-                    traj_abs[:] = absorb_slice
-                if dones_slice is not None:
-                    traj_done = trajectory_group.create_dataset(
-                        "done", shape=dones_slice.shape, dtype=dones_slice.dtype
-                    )
-                    traj_done[:] = dones_slice
+    def _create_transition_dataset(
+        self, group: zarr.Group, name: str, data: np.ndarray
+    ) -> None:
+        """Create and populate a transition dataset in Zarr."""
+        ds = group.create_dataset(name, shape=data.shape, dtype=data.dtype)
+        ds[:] = data
