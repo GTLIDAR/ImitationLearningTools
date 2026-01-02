@@ -17,8 +17,8 @@ from loco_mujoco.task_factories import (
 from omegaconf import DictConfig
 from zarr.storage import LocalStore
 
-from iltools_core.metadata_schema import DatasetMeta
-from iltools_datasets.base_loader import BaseLoader
+from iltools.core.metadata_schema import DatasetMeta
+from iltools.datasets.base_loader import BaseLoader
 
 # Type aliases for improved readability
 MotionEntry = dict[str, Any]
@@ -100,7 +100,7 @@ class LocoMuJoCoLoader(BaseLoader):
         self.env_info = {}
         self._trajectory_info_list, self._motion_info_dict = self._get_trajectories(
             build_zarr_dataset=build_zarr_dataset,
-            path=zarr_path,
+            path=zarr_path or kwargs.pop("path", None),
             **kwargs,
         )
         self._metadata = self._discover_metadata()

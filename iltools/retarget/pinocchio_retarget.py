@@ -1,8 +1,9 @@
-
-import pinocchio as pin
 import numpy as np
-from iltools_retarget.base_retarget import BaseRetarget
-from iltools_core.trajectory import Trajectory
+import pinocchio as pin
+
+from iltools.core.trajectory import Trajectory
+from iltools.retarget.base_retarget import BaseRetarget
+
 
 class PinocchioRetarget(BaseRetarget):
     """

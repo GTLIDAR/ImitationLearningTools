@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "iltools"
-version = "0.4.0"
+version = "0.5.0"
 authors = [{ name = "Feiyang Wu", email = "feiyang.wu@gatech.edu" }]
 description = "Modular toolkit for robot imitation learning"
 readme = "README.md"
@@ -26,11 +26,10 @@ dependencies = [
     "mediapy",
     "matplotlib",
     "pytest",
-
 ]
 
 [project.optional-dependencies]
-"loco-mujoco" = ["loco-mujoco"]
+loco-mujoco = ["loco-mujoco"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
@@ -45,3 +44,6 @@ filterwarnings = [
     "ignore::DeprecationWarning:jaxopt.*",
     "ignore::DeprecationWarning:tensorflow_probability.*",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["iltools"]

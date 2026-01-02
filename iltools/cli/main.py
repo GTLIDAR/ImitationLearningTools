@@ -1,10 +1,10 @@
 import typer
 from rich.console import Console
 from rich.table import Table
-from iltools_datasets.amass.loader import AmassLoader
-from iltools_datasets.loco_mujoco.loader import LocoMuJoCoLoader
-from iltools_datasets.trajopt.loader import TrajoptLoader
-from iltools_retarget.pinocchio_retarget import PinocchioRetarget
+
+from iltools.datasets.amass.loader import AmassLoader
+from iltools.datasets.loco_mujoco.loader import LocoMuJoCoLoader
+from iltools.datasets.trajopt.loader import TrajoptLoader
 
 app = typer.Typer(help="Imitation Learning Tools CLI")
 console = Console()

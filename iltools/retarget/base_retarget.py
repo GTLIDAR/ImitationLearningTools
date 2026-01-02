@@ -1,6 +1,7 @@
-
 from abc import ABC, abstractmethod
-from iltools_core.trajectory import Trajectory
+
+from iltools.core.trajectory import Trajectory
+
 
 class BaseRetarget(ABC):
     """

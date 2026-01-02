@@ -1,6 +1,7 @@
-import pytest
-import sys
 import os
+import sys
+
+import pytest
 
 # Try to import mujoco and mujoco.viewer
 try:

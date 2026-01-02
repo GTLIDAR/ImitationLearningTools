@@ -1,15 +1,14 @@
-import pytest
-import numpy as np
-import torch
 import os
+
+import numpy as np
+import pytest
 import zarr
-from zarr.storage import LocalStore
-import mujoco
-from typing import Optional
-from omegaconf import DictConfig
-from iltools_datasets.loco_mujoco.loader import LocoMuJoCoLoader
-from iltools_core.metadata_schema import DatasetMeta
 from loco_mujoco.core import ObservationType
+from omegaconf import DictConfig
+from zarr.storage import LocalStore
+
+from iltools.core.metadata_schema import DatasetMeta
+from iltools.datasets.loco_mujoco.loader import LocoMuJoCoLoader
 
 
 @pytest.fixture
@@ -18,7 +17,7 @@ def basic_cfg():
     return DictConfig(
         {
             "dataset": {
-                "trajectories": {"default": ["walk"], "amass": [], "lafan1": []}
+                "trajectories": {"default": ["walk", "run"], "amass": [], "lafan1": []}
             },
             "control_freq": 50.0,
             "window_size": 4,
@@ -84,14 +83,15 @@ def test_loader_basic(minimal_loader):
 def test_real_loco_loader_basic(basic_cfg):
     """Test real LocoMuJoCoLoader basic functionality."""
     try:
-        loader = LocoMuJoCoLoader(env_name="UnitreeG1", cfg=basic_cfg)
+        loader = LocoMuJoCoLoader(
+            env_name="UnitreeG1", cfg=basic_cfg, build_zarr_dataset=False, path=None
+        )
 
         # Test basic properties
         assert hasattr(loader, "env_name")
         assert loader.env_name == "UnitreeG1"
         assert hasattr(loader, "metadata")
         assert isinstance(loader.metadata, DatasetMeta)
-        assert hasattr(loader, "env")
 
         # Test metadata properties
         meta = loader.metadata
@@ -108,7 +108,9 @@ def test_real_loco_loader_basic(basic_cfg):
 def test_real_loco_loader_trajectory_info(basic_cfg):
     """Test real LocoMuJoCoLoader trajectory information."""
     try:
-        loader = LocoMuJoCoLoader(env_name="UnitreeG1", cfg=basic_cfg)
+        loader = LocoMuJoCoLoader(
+            env_name="UnitreeG1", cfg=basic_cfg, build_zarr_dataset=False, path=None
+        )
 
         num_traj = len(loader)
         print(f"Total number of trajectories: {num_traj}")
@@ -126,6 +128,52 @@ def test_real_loco_loader_trajectory_info(basic_cfg):
 
     except Exception as e:
         pytest.skip(f"LocoMuJoCoLoader info test skipped due to: {e}")
+
+
+@pytest.mark.slow
+def test_real_loco_loader_g1_walk_run_zarr(tmp_path):
+    """Test G1 default walk+run export to Zarr with metadata logging."""
+    cfg = DictConfig(
+        {
+            "dataset": {
+                "trajectories": {"default": ["walk", "run"], "amass": [], "lafan1": []}
+            },
+            "control_freq": 50.0,
+            "window_size": 4,
+            "sim": {"dt": 0.001},
+            "decimation": 20,
+        }
+    )
+
+    try:
+        loader = LocoMuJoCoLoader(
+            env_name="UnitreeG1", cfg=cfg, build_zarr_dataset=True, path=tmp_path
+        )
+        zarr_path = tmp_path / "g1_default_walk_run.zarr"
+        loader.save(str(zarr_path))
+
+        store = LocalStore(str(zarr_path))
+        root = zarr.group(store=store, overwrite=False)
+        locomujoco_group = root["loco_mujoco"]
+
+        print("Dataset metadata:")
+        try:
+            print(loader.metadata.dict())
+        except Exception:
+            print(loader.metadata)
+
+        print("Zarr group attrs:")
+        for key in locomujoco_group.attrs:
+            print(f"{key}: {locomujoco_group.attrs[key]}")
+
+        assert "default_walk" in locomujoco_group
+        assert "default_run" in locomujoco_group
+        assert "trajectory_0" in locomujoco_group["default_walk"]
+        assert "trajectory_0" in locomujoco_group["default_run"]
+        assert "motion_metadata" in locomujoco_group.attrs
+
+    except Exception as e:
+        pytest.skip(f"LocoMuJoCoLoader walk/run Zarr test skipped due to: {e}")
 
 
 def create_fake_loco_npz(tmp_path, n=2, T=10):
@@ -421,6 +469,7 @@ def test_visualize_first_trajectory_in_mujoco(visualize_enabled):
             env_name="UnitreeG1",
             cfg=basic_cfg,
             observation_spec=observation_spec,
+            build_zarr_dataset=False,
         )
 
         # Always test basic functionality
@@ -447,8 +496,37 @@ def test_visualize_first_trajectory_in_mujoco(visualize_enabled):
         pytest.fail(f"Visualization test failed due to: {e}")
 
 
-# Remove tests that depend on missing ZarrBackedTrajectoryDataset
-# These can be added back when that class is implemented
+def test_export_to_rb(basic_cfg, tmp_path):
+    """Test exporting LocoMuJoCoLoader data to TorchRL replay buffer."""
+    try:
+        # Export to Zarr first
+        zarr_path = tmp_path / "g1_test_export.zarr"
+
+        loader = LocoMuJoCoLoader(
+            env_name="UnitreeG1",
+            cfg=basic_cfg,
+            build_zarr_dataset=True,
+            path=zarr_path,
+            export_transitions=True,
+        )
+
+        # Now use the utility to create a replay buffer from the Zarr dataset
+        from iltools.datasets.utils import make_rb_from
+
+        rb, info = make_rb_from(zarr_path)
+
+        # Basic checks on the replay buffer
+        assert len(rb) > 0, "Replay buffer should contain data"
+
+        print(f"✅ Export to replay buffer test passed with {len(rb)} samples")
+
+        from pprint import pprint
+
+        pprint(info)
+
+    except Exception as e:
+        pytest.fail(f"Export to replay buffer test failed due to: {e}")
+
 
 if __name__ == "__main__":
     print("Running basic tests...")

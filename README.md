@@ -89,7 +89,7 @@ Here is an example of how to use the `TrajectoryDatasetManager` to load and step
 import torch
 from tensordict import TensorDict
 
-from iltools_datasets.dataset_manager import TrajectoryDatasetManager
+from iltools.datasets.dataset_manager import TrajectoryDatasetManager
 
 # Mock configuration for demonstration
 class MockConfig:
