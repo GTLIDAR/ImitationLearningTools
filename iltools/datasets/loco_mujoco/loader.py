@@ -91,7 +91,7 @@ class LocoMuJoCoLoader(BaseLoader):
         self.logger.info("Initializing LocoMuJoCoLoader")
         self.cfg = cfg
         self.env_name = env_name
-        self.dataset_dict: dict[str, list[str | dict[str, str]]] = cfg.dataset.get(
+        self.dataset_dict: dict[str, list[str | dict[str, str]]] = cfg["dataset"].get(
             "trajectories", {"default": ["walk"], "amass": [], "lafan1": []}
         )
         self.logger.info("Dataset dictionary: %s", self.dataset_dict)

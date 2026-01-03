@@ -33,7 +33,7 @@ class ResetSchedule:
 
 
 class ParallelTrajectoryManager:
-    """Manage `n_envs` logical environments, each bound to one expert trajectory.
+    """Manage `num_envs` logical environments, each bound to one expert trajectory.
 
     - Each env tracks a `(traj_rank, local_step)` cursor.
     - Sampling is done by direct indexing into the replay buffer storage with the
@@ -48,7 +48,7 @@ class ParallelTrajectoryManager:
         *,
         rb: TensorDictReplayBuffer,
         traj_info: dict,
-        n_envs: int,
+        num_envs: int,
         reset_schedule: str = ResetSchedule.RANDOM,
         custom_reset_fn: Optional[Callable[[Tensor, int], Tensor]] = None,
         wrap_steps: bool = False,
@@ -62,9 +62,9 @@ class ParallelTrajectoryManager:
         self.custom_reset_fn = custom_reset_fn
         self.wrap_steps = bool(wrap_steps)
 
-        if n_envs <= 0:
-            raise ValueError("n_envs must be positive")
-        self.n_envs = int(n_envs)
+        if num_envs <= 0:
+            raise ValueError("num_envs must be positive")
+        self.num_envs = int(num_envs)
 
         self._device = torch.device(device) if device is not None else None
 
@@ -89,19 +89,35 @@ class ParallelTrajectoryManager:
         self._ordered_traj_list = list(ordered)
 
         # Per-env state
-        self.env_traj_rank = torch.zeros((self.n_envs,), dtype=torch.int64)
-        self.env_step = torch.zeros((self.n_envs,), dtype=torch.int64)
+        self.env_traj_rank = torch.zeros((self.num_envs,), dtype=torch.int64)
+        self.env_step = torch.zeros((self.num_envs,), dtype=torch.int64)
 
         # State for sequential scheduling
         self._next_rank = 0
 
         # Initialize all envs
-        self.reset_envs(torch.arange(self.n_envs, dtype=torch.int64))
+        self.reset_envs(torch.arange(self.num_envs, dtype=torch.int64))
 
         # Get the mapping from reference to target joint names
-        self.map_ref_to_target, self.map_target_to_ref = _map_reference_to_target(
+        self.map_target_to_ref, self.map_ref_to_target = _map_reference_to_target(
             reference_joint_names, target_joint_names, self._device
         )
+        self.target_mask = torch.zeros(
+            len(target_joint_names), dtype=torch.bool, device=self._device
+        )
+        self.target_mask[self.map_target_to_ref] = True
+
+        # Memory allocate for important data
+        self.joint_pos = torch.empty(
+            num_envs, len(target_joint_names), device=device, dtype=torch.float32
+        )
+        self.joint_vel = torch.empty(
+            num_envs, len(target_joint_names), device=device, dtype=torch.float32
+        )
+        self.root_pos = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
+        self.root_quat = torch.empty(num_envs, 4, device=device, dtype=torch.float32)
+        self.root_lin_vel = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
+        self.root_ang_vel = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
 
     @property
     def num_trajectories(self) -> int:
@@ -218,7 +234,7 @@ class ParallelTrajectoryManager:
     ) -> TensorDict:
         """Sample one transition per env (or subset) via direct storage indexing."""
         if env_ids is None:
-            env_ids_t = torch.arange(self.n_envs, dtype=torch.int64)
+            env_ids_t = torch.arange(self.num_envs, dtype=torch.int64)
         else:
             env_ids_t = (
                 env_ids
@@ -231,13 +247,40 @@ class ParallelTrajectoryManager:
 
         idx = get_global_index(r, self._start, self._end, step)
         # Direct indexing into storage (fast path)
-        td = self.rb._storage[idx]  # type: ignore[attr-defined]
+        td = self.rb[idx]
 
         if self._device is not None:
             td = td.to(self._device)
 
         if advance:
             self._advance_steps(env_ids_t)
+
+        # Append additional common tensors to current reference
+        qpos = td.get("qpos")
+        qvel = td.get("qvel")
+        assert qpos is not None and qvel is not None, (
+            "qpos and qvel must be present in the reference data"
+        )
+        self.root_qpos = qpos[..., 0:3]
+        self.root_quat = qpos[..., 3:7]
+        self.root_lin_vel = qvel[..., 0:3]
+        self.root_ang_vel = qvel[..., 3:6]
+        joint_pos = qpos[:, 7:]
+        joint_vel = qvel[:, 6:]
+        self.joint_pos[..., self.map_ref_to_target] = joint_pos[
+            ..., self.map_target_to_ref
+        ]
+        self.joint_vel[..., self.map_ref_to_target] = joint_vel[
+            ..., self.map_target_to_ref
+        ]
+        self.joint_pos[..., ~self.target_mask] = torch.nan
+        self.joint_vel[..., ~self.target_mask] = torch.nan
+        td.set(key="root_pos", item=self.root_pos)
+        td.set(key="root_quat", item=self.root_quat)
+        td.set(key="root_lin_vel", item=self.root_lin_vel)
+        td.set(key="root_ang_vel", item=self.root_ang_vel)
+        td.set(key="joint_pos", item=self.joint_pos)
+        td.set(key="joint_vel", item=self.joint_vel)
 
         return td
 
