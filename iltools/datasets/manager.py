@@ -9,7 +9,7 @@ from tensordict import TensorDict
 from torch import Tensor
 from torchrl.data import TensorDictReplayBuffer
 
-from iltools.datasets.utils import (
+from .utils import (
     _map_reference_to_target,
     get_ith_traj_info,
     get_traj_rank_from_info,
@@ -108,7 +108,7 @@ class ParallelTrajectoryManager:
         )
 
         # Get the mapping from reference to target joint names
-        self.target_to_ref_map, self.ref_to_target_map = _map_reference_to_target(
+        self.ref_to_target_map, self.target_to_ref_map = _map_reference_to_target(
             reference_joint_names, target_joint_names, self._device
         )
         self._num_target_joints = len(target_joint_names)

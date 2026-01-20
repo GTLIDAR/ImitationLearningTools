@@ -47,3 +47,11 @@ filterwarnings = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["iltools"]
+
+[tool.pyrefly]
+search-path = [
+    'iltools/datasets',
+    'iltools/cli',
+    'iltools/core',
+    'iltools/retarget',
+]
