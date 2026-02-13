@@ -178,7 +178,10 @@ class LocoMuJoCoLoader(BaseLoader):
             raise ValueError(f"Unknown dataset type: {dataset_type}")
 
         return ImitationFactory.make(
-            self.env_name, **factory_configs[dataset_type](motion)
+            self.env_name,
+            **factory_configs[dataset_type](motion),
+            timestep=self.cfg["sim"]["dt"],
+            n_substeps=self.cfg["n_substeps"],
         )
 
     def _get_trajectories(
