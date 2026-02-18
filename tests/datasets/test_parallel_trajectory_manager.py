@@ -159,6 +159,58 @@ def test_parallel_trajectory_manager_sample_slice_modes(tmp_path):
     assert torch.allclose(obs_contig, expected_contig)
 
 
+def test_parallel_trajectory_manager_root_pose_is_relative_to_first_step(tmp_path):
+    from iltools.datasets.manager import ParallelTrajectoryManager, ResetSchedule
+
+    storage = LazyMemmapStorage(3, scratch_dir=str(tmp_path), device="cpu", existsok=True)
+    rb = TensorDictReplayBuffer(storage=storage)
+
+    qpos = torch.tensor(
+        [
+            [1.0, 2.0, 0.0, 0.70710677, 0.0, 0.0, 0.70710677, 0.0, 0.0],
+            [2.0, 2.0, 0.0, 0.70710677, 0.0, 0.0, 0.70710677, 0.0, 0.0],
+            [1.0, 3.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    qvel = torch.zeros((3, 8), dtype=torch.float32)
+    td = TensorDict(
+        {"obs": torch.zeros((3, 1)), "done": torch.zeros((3, 1), dtype=torch.bool), "qpos": qpos, "qvel": qvel},
+        batch_size=[3],
+    )
+    rb.extend(td)
+    traj_info = {"start_index": [0], "end_index": [3], "ordered_traj_list": [("ds", "m", "t0")]}
+
+    mgr = ParallelTrajectoryManager(
+        rb=rb,
+        traj_info=traj_info,
+        num_envs=1,
+        reset_schedule=ResetSchedule.RANDOM,
+        target_joint_names=["joint1", "joint2"],
+        reference_joint_names=["joint1", "joint2"],
+    )
+
+    mgr.set_env_cursor(env_ids=[0], ranks=torch.tensor([0]), steps=torch.tensor([0]))
+    td0 = mgr.sample(env_ids=[0], advance=False)
+    assert torch.allclose(td0["raw_root_pos"][0], torch.tensor([1.0, 2.0, 0.0]))
+    assert torch.allclose(td0["root_pos"][0], torch.zeros(3), atol=1.0e-6)
+    assert torch.allclose(td0["root_quat"][0], torch.tensor([1.0, 0.0, 0.0, 0.0]), atol=1.0e-5)
+
+    mgr.set_env_cursor(env_ids=[0], ranks=torch.tensor([0]), steps=torch.tensor([1]))
+    td1 = mgr.sample(env_ids=[0], advance=False)
+    assert torch.allclose(td1["raw_root_pos"][0], torch.tensor([2.0, 2.0, 0.0]))
+    assert torch.allclose(td1["root_pos"][0], torch.tensor([0.0, -1.0, 0.0]), atol=1.0e-5)
+    assert torch.allclose(td1["root_quat"][0], torch.tensor([1.0, 0.0, 0.0, 0.0]), atol=1.0e-5)
+
+    mgr.set_env_cursor(env_ids=[0], ranks=torch.tensor([0]), steps=torch.tensor([2]))
+    td2 = mgr.sample(env_ids=[0], advance=False)
+    assert torch.allclose(td2["raw_root_pos"][0], torch.tensor([1.0, 3.0, 0.0]))
+    assert torch.allclose(td2["root_pos"][0], torch.tensor([1.0, 0.0, 0.0]), atol=1.0e-5)
+    assert torch.allclose(
+        td2["root_quat"][0], torch.tensor([0.70710677, 0.0, 0.0, 0.70710677]), atol=1.0e-5
+    )
+
+
 @pytest.mark.slow
 def test_parallel_trajectory_manager_loco_mujoco_walk_run(tmp_path):
     """Integration test: export Loco-MuJoCo default walk+run, then test manager indexing."""
