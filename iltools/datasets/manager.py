@@ -313,8 +313,11 @@ class ParallelTrajectoryManager:
         start_root_quat_inv = _quat_inverse(start_root_quat)
         root_pos = _quat_apply(start_root_quat_inv, raw_root_pos - start_root_pos)
         root_quat = _quat_normalize(_quat_mul(start_root_quat_inv, raw_root_quat))
-        root_lin_vel = qvel[..., 0:3]
-        root_ang_vel = qvel[..., 3:6]
+        # Keep root velocities in the same trajectory-local frame as root pose/quat.
+        # This avoids frame-mismatch when replay/reward code later rotates references
+        # by the reset-frame orientation.
+        root_lin_vel = _quat_apply(start_root_quat_inv, qvel[..., 0:3])
+        root_ang_vel = _quat_apply(start_root_quat_inv, qvel[..., 3:6])
 
         if use_buffers:
             self.raw_root_pos.copy_(raw_root_pos)
