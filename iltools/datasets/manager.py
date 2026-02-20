@@ -18,48 +18,6 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
-def _quat_conjugate(quat: Tensor) -> Tensor:
-    out = quat.clone()
-    out[..., 1:] = -out[..., 1:]
-    return out
-
-
-def _quat_normalize(quat: Tensor, eps: float = 1.0e-12) -> Tensor:
-    return quat / torch.linalg.norm(quat, dim=-1, keepdim=True).clamp_min(eps)
-
-
-def _quat_inverse(quat: Tensor) -> Tensor:
-    return _quat_conjugate(_quat_normalize(quat))
-
-
-def _quat_mul(quat0: Tensor, quat1: Tensor) -> Tensor:
-    w0, x0, y0, z0 = quat0.unbind(dim=-1)
-    w1, x1, y1, z1 = quat1.unbind(dim=-1)
-    return torch.stack(
-        (
-            w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1,
-            w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1,
-            w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1,
-            w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1,
-        ),
-        dim=-1,
-    )
-
-
-def _quat_apply(quat: Tensor, vec: Tensor) -> Tensor:
-    quat_w = quat[..., :1]
-    quat_xyz = quat[..., 1:]
-    t = 2.0 * torch.cross(quat_xyz, vec, dim=-1)
-    return vec + quat_w * t + torch.cross(quat_xyz, t, dim=-1)
-
-
-def _expand_for_broadcast(base: Tensor, target: Tensor) -> Tensor:
-    out = base
-    while out.ndim < target.ndim:
-        out = out.unsqueeze(1)
-    return out
-
-
 def get_global_index(
     rank: Tensor, start: Tensor, end: Tensor, local_step: Tensor
 ) -> Tensor:
@@ -173,7 +131,6 @@ class ParallelTrajectoryManager:
         )
         self.root_pos = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
         self.root_quat = torch.empty(num_envs, 4, device=device, dtype=torch.float32)
-        self.raw_root_pos = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
         self.root_lin_vel = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
         self.root_ang_vel = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
 
@@ -222,7 +179,9 @@ class ParallelTrajectoryManager:
 
         if self.reset_schedule == ResetSchedule.SEQUENTIAL:
             base = self._next_rank
-            ranks = (torch.arange(n, dtype=torch.int64, device=env_ids.device) + base) % self.num_trajectories
+            ranks = (
+                torch.arange(n, dtype=torch.int64, device=env_ids.device) + base
+            ) % self.num_trajectories
             self._next_rank = int((base + n) % self.num_trajectories)
             return ranks
 
@@ -262,7 +221,9 @@ class ParallelTrajectoryManager:
         if ranks is None:
             new_ranks = self._choose_new_ranks(env_ids_t)
         else:
-            new_ranks = torch.as_tensor(ranks, dtype=torch.int64, device=env_ids_t.device)
+            new_ranks = torch.as_tensor(
+                ranks, dtype=torch.int64, device=env_ids_t.device
+            )
             if new_ranks.shape != env_ids_t.shape:
                 raise ValueError("ranks must have the same shape as env_ids")
             new_ranks = new_ranks % self.num_trajectories
@@ -330,21 +291,15 @@ class ParallelTrajectoryManager:
         start_qpos = start_td.get("qpos")
         assert start_qpos is not None, "qpos must be present in the reference data"
 
-        raw_root_pos = qpos[..., 0:3]
-        raw_root_quat = qpos[..., 3:7]
-        start_root_pos = _expand_for_broadcast(start_qpos[..., 0:3], raw_root_pos)
-        start_root_quat = _expand_for_broadcast(start_qpos[..., 3:7], raw_root_quat)
-        start_root_quat_inv = _quat_inverse(start_root_quat)
-        root_pos = _quat_apply(start_root_quat_inv, raw_root_pos - start_root_pos)
-        root_quat = _quat_normalize(_quat_mul(start_root_quat_inv, raw_root_quat))
+        root_pos = qpos[..., 0:3]
+        root_quat = qpos[..., 3:7]
         # Keep root velocities in the same trajectory-local frame as root pose/quat.
         # This avoids frame-mismatch when replay/reward code later rotates references
         # by the reset-frame orientation.
-        root_lin_vel = _quat_apply(start_root_quat_inv, qvel[..., 0:3])
-        root_ang_vel = _quat_apply(start_root_quat_inv, qvel[..., 3:6])
+        root_lin_vel = qvel[..., 0:3]
+        root_ang_vel = qvel[..., 3:6]
 
         if use_buffers:
-            self.raw_root_pos.copy_(raw_root_pos)
             self.root_pos.copy_(root_pos)
             self.root_quat.copy_(root_quat)
             self.root_lin_vel.copy_(root_lin_vel)
@@ -362,7 +317,6 @@ class ParallelTrajectoryManager:
             self.joint_pos[..., ~self.target_mask] = torch.nan
             self.joint_vel[..., ~self.target_mask] = torch.nan
 
-            td.set(key="raw_root_pos", item=self.raw_root_pos)
             td.set(key="root_pos", item=self.root_pos)
             td.set(key="root_quat", item=self.root_quat)
             td.set(key="root_lin_vel", item=self.root_lin_vel)
@@ -395,7 +349,6 @@ class ParallelTrajectoryManager:
             ..., self.target_to_ref_map
         ]
 
-        td.set(key="raw_root_pos", item=raw_root_pos)
         td.set(key="root_pos", item=root_pos)
         td.set(key="root_quat", item=root_quat)
         td.set(key="root_lin_vel", item=root_lin_vel)
