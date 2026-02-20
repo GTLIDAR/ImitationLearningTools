@@ -96,6 +96,7 @@ class ParallelTrajectoryManager:
         num_envs: int,
         reset_schedule: str = ResetSchedule.RANDOM,
         custom_reset_fn: Optional[Callable[[Tensor, int], Tensor]] = None,
+        reset_start_step: int = 0,
         wrap_steps: bool = False,
         device: torch.device | str | None = None,
         target_joint_names: Optional[Sequence[str]] = None,
@@ -105,6 +106,9 @@ class ParallelTrajectoryManager:
         self.traj_info = traj_info
         self.reset_schedule = reset_schedule
         self.custom_reset_fn = custom_reset_fn
+        if int(reset_start_step) < 0:
+            raise ValueError("reset_start_step must be >= 0")
+        self.reset_start_step = int(reset_start_step)
         self.wrap_steps = bool(wrap_steps)
 
         if num_envs <= 0:
@@ -143,10 +147,11 @@ class ParallelTrajectoryManager:
         # Initialize all envs
         self.reset_envs(torch.arange(self.num_envs, dtype=torch.int64))
         logger.info(
-            "Initialized ParallelTrajectoryManager(num_envs=%s, num_trajectories=%s, reset_schedule=%s)",
+            "Initialized ParallelTrajectoryManager(num_envs=%s, num_trajectories=%s, reset_schedule=%s, reset_start_step=%s)",
             self.num_envs,
             self.num_trajectories,
             self.reset_schedule,
+            self.reset_start_step,
         )
 
         # Get the mapping from reference to target joint names
@@ -192,20 +197,32 @@ class ParallelTrajectoryManager:
             )
         )
 
+    def _normalize_env_ids(self, env_ids: Sequence[int] | Tensor) -> Tensor:
+        env_ids_t = (
+            env_ids
+            if isinstance(env_ids, torch.Tensor)
+            else torch.as_tensor(list(env_ids), dtype=torch.int64)
+        )
+        return env_ids_t.to(device=self.env_traj_rank.device, dtype=torch.int64)
+
     def _choose_new_ranks(self, env_ids: Tensor) -> Tensor:
-        env_ids = env_ids.to(dtype=torch.int64)
+        env_ids = self._normalize_env_ids(env_ids)
         n = int(env_ids.numel())
         if n == 0:
-            return torch.empty((0,), dtype=torch.int64)
+            return torch.empty((0,), dtype=torch.int64, device=env_ids.device)
 
         if self.reset_schedule == ResetSchedule.RANDOM:
             return torch.randint(
-                low=0, high=self.num_trajectories, size=(n,), dtype=torch.int64
+                low=0,
+                high=self.num_trajectories,
+                size=(n,),
+                dtype=torch.int64,
+                device=env_ids.device,
             )
 
         if self.reset_schedule == ResetSchedule.SEQUENTIAL:
             base = self._next_rank
-            ranks = (torch.arange(n, dtype=torch.int64) + base) % self.num_trajectories
+            ranks = (torch.arange(n, dtype=torch.int64, device=env_ids.device) + base) % self.num_trajectories
             self._next_rank = int((base + n) % self.num_trajectories)
             return ranks
 
@@ -221,7 +238,7 @@ class ParallelTrajectoryManager:
                     "Provide custom_reset_fn(env_ids, num_trajectories)->ranks."
                 )
             ranks = self.custom_reset_fn(env_ids, self.num_trajectories)
-            ranks = torch.as_tensor(ranks, dtype=torch.int64)
+            ranks = torch.as_tensor(ranks, dtype=torch.int64, device=env_ids.device)
             if ranks.shape != (n,):
                 raise ValueError(
                     "custom_reset_fn must return a 1D tensor of shape [len(env_ids)]"
@@ -231,31 +248,35 @@ class ParallelTrajectoryManager:
         raise ValueError(f"Unknown reset_schedule: {self.reset_schedule}")
 
     def reset_envs(
-        self, env_ids: Sequence[int] | Tensor, *, ranks: Optional[Tensor] = None
+        self,
+        env_ids: Sequence[int] | Tensor,
+        *,
+        ranks: Optional[Tensor] = None,
+        steps: Optional[Tensor | int] = None,
     ) -> None:
-        """Reset selected envs: set step=0 and (optionally) reassign traj_rank."""
-        env_ids_t = (
-            env_ids
-            if isinstance(env_ids, torch.Tensor)
-            else torch.as_tensor(list(env_ids), dtype=torch.int64)
-        ).to(dtype=torch.int64)
+        """Reset selected envs: set step and (optionally) reassign traj_rank."""
+        env_ids_t = self._normalize_env_ids(env_ids)
         if env_ids_t.numel() == 0:
             return
 
         if ranks is None:
             new_ranks = self._choose_new_ranks(env_ids_t)
         else:
-            new_ranks = torch.as_tensor(ranks, dtype=torch.int64)
+            new_ranks = torch.as_tensor(ranks, dtype=torch.int64, device=env_ids_t.device)
             if new_ranks.shape != env_ids_t.shape:
                 raise ValueError("ranks must have the same shape as env_ids")
             new_ranks = new_ranks % self.num_trajectories
 
         self.env_traj_rank[env_ids_t] = new_ranks
-        self.env_step[env_ids_t] = 0
+        if steps is None:
+            self._set_env_steps(env_ids_t, self.reset_start_step)
+        else:
+            self._set_env_steps(env_ids_t, steps)
         logger.debug(
-            "Reset envs %s -> ranks %s",
+            "Reset envs %s -> ranks %s, start_steps %s",
             env_ids_t.tolist(),
             new_ranks.tolist(),
+            self.env_step[env_ids_t].tolist(),
         )
 
     def set_env_cursor(
@@ -263,15 +284,11 @@ class ParallelTrajectoryManager:
         *,
         env_ids: Sequence[int] | Tensor,
         ranks: Tensor,
-        steps: Optional[Tensor] = None,
+        steps: Optional[Tensor | int] = None,
     ) -> None:
         """Set (rank, step) for a set of envs."""
-        env_ids_t = (
-            env_ids
-            if isinstance(env_ids, torch.Tensor)
-            else torch.as_tensor(list(env_ids), dtype=torch.int64)
-        ).to(dtype=torch.int64)
-        ranks_t = torch.as_tensor(ranks, dtype=torch.int64)
+        env_ids_t = self._normalize_env_ids(env_ids)
+        ranks_t = torch.as_tensor(ranks, dtype=torch.int64, device=env_ids_t.device)
         if ranks_t.shape != env_ids_t.shape:
             raise ValueError("ranks must have the same shape as env_ids")
         self.env_traj_rank[env_ids_t] = ranks_t % self.num_trajectories
@@ -279,13 +296,20 @@ class ParallelTrajectoryManager:
         if steps is None:
             self.env_step[env_ids_t] = 0
         else:
-            steps_t = torch.as_tensor(steps, dtype=torch.int64)
+            self._set_env_steps(env_ids_t, steps)
+
+    def _set_env_steps(self, env_ids_t: Tensor, steps: Tensor | int) -> None:
+        env_ids_t = self._normalize_env_ids(env_ids_t)
+        if isinstance(steps, int):
+            steps_t = torch.full_like(env_ids_t, int(steps), dtype=torch.int64)
+        else:
+            steps_t = torch.as_tensor(steps, dtype=torch.int64, device=env_ids_t.device)
             if steps_t.shape != env_ids_t.shape:
                 raise ValueError("steps must have the same shape as env_ids")
-            # Clamp into valid range for each env's trajectory
-            r = self.env_traj_rank[env_ids_t]
-            max_step = (self._length[r] - 1).clamp(min=0)
-            self.env_step[env_ids_t] = torch.minimum(steps_t.clamp(min=0), max_step)
+        # Clamp into valid range for each env's trajectory
+        r = self.env_traj_rank[env_ids_t]
+        max_step = (self._length[r] - 1).clamp(min=0)
+        self.env_step[env_ids_t] = torch.minimum(steps_t.clamp(min=0), max_step)
 
     def _attach_reference_fields(
         self, td: TensorDict, traj_ranks: Tensor, *, use_buffers: bool
@@ -385,13 +409,11 @@ class ParallelTrajectoryManager:
     ) -> TensorDict:
         """Sample one transition per env (or subset) via direct storage indexing."""
         if env_ids is None:
-            env_ids_t = torch.arange(self.num_envs, dtype=torch.int64)
+            env_ids_t = torch.arange(
+                self.num_envs, dtype=torch.int64, device=self.env_traj_rank.device
+            )
         else:
-            env_ids_t = (
-                env_ids
-                if isinstance(env_ids, torch.Tensor)
-                else torch.as_tensor(list(env_ids), dtype=torch.int64)
-            ).to(dtype=torch.int64)
+            env_ids_t = self._normalize_env_ids(env_ids)
 
         r = self.env_traj_rank[env_ids_t]
         step = self.env_step[env_ids_t]
@@ -433,13 +455,11 @@ class ParallelTrajectoryManager:
         if mode not in {"contiguous", "independent"}:
             raise ValueError("mode must be 'contiguous' or 'independent'")
         if env_ids is None:
-            env_ids_t = torch.arange(self.num_envs, dtype=torch.int64)
+            env_ids_t = torch.arange(
+                self.num_envs, dtype=torch.int64, device=self.env_traj_rank.device
+            )
         else:
-            env_ids_t = (
-                env_ids
-                if isinstance(env_ids, torch.Tensor)
-                else torch.as_tensor(list(env_ids), dtype=torch.int64)
-            ).to(dtype=torch.int64)
+            env_ids_t = self._normalize_env_ids(env_ids)
 
         r = self.env_traj_rank[env_ids_t]
         length = self._length[r].clamp(min=1)
@@ -512,6 +532,7 @@ class ParallelTrajectoryManager:
         return self._attach_reference_fields(td, traj_ranks=r, use_buffers=False)
 
     def _advance_steps(self, env_ids: Tensor) -> None:
+        env_ids = self._normalize_env_ids(env_ids)
         r = self.env_traj_rank[env_ids]
         length = self._length[r].clamp(min=1)  # avoid div-by-zero
         step = self.env_step[env_ids]

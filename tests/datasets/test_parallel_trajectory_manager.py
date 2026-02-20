@@ -122,6 +122,26 @@ def test_parallel_trajectory_manager_round_robin(tmp_path):
     assert mgr.env_traj_rank.tolist() == [1, 1]
 
 
+def test_parallel_trajectory_manager_reset_start_step(tmp_path):
+    from iltools.datasets.manager import ParallelTrajectoryManager, ResetSchedule
+
+    rb, traj_info = _make_dummy_rb_and_traj_info(tmp_path, lengths=(3, 5))
+    mgr = ParallelTrajectoryManager(
+        rb=rb,
+        traj_info=traj_info,
+        num_envs=2,
+        reset_schedule=ResetSchedule.SEQUENTIAL,
+        reset_start_step=2,
+        target_joint_names=["joint1", "joint2"],
+        reference_joint_names=["joint1", "joint2"],
+    )
+    assert mgr.env_step.tolist() == [2, 2]
+
+    # Explicit reset steps override the default reset_start_step.
+    mgr.reset_envs([0], steps=1)
+    assert mgr.env_step.tolist()[0] == 1
+
+
 def test_parallel_trajectory_manager_sample_slice_modes(tmp_path):
     from iltools.datasets.manager import ParallelTrajectoryManager, ResetSchedule
 
