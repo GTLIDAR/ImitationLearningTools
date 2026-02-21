@@ -13,7 +13,6 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "pydantic",
-    "smplx",
     "rich",
     "hydra-core",
     "zarr>3",
