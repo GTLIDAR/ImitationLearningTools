@@ -81,6 +81,52 @@ Dataset/
 
 E.g. We currently support ```loco-mujoco``` dataset with various motions such as ```default-walk``` with ```1``` trajectory. Install the optional extra to enable this loader.
 
+### LAFAN1 CSV Loader
+
+You can also build a replay-ready Zarr dataset directly from prepared CSV (or NPZ) motions using
+`Lafan1CsvLoader`. The CSV format follows the mimic preprocessing convention:
+
+- columns `0:3`: root position
+- columns `3:7`: root quaternion in `xyzw` (internally converted to `wxyz`)
+- columns `7:`: joint positions
+
+```python
+from iltools.datasets.lafan1.loader import Lafan1CsvLoader
+
+cfg = {
+    "dataset": {
+        "trajectories": {
+            "lafan1_csv": [
+                "/path/to/motions/walk_001.csv",
+                {"path": "/path/to/motions/dance_002.csv", "input_fps": 60, "frame_range": [1, 1200]},
+            ]
+        }
+    },
+    "control_freq": 50,   # output sampling frequency
+    "input_fps": 60,      # default input fps for csv files
+}
+
+loader = Lafan1CsvLoader(cfg=cfg, build_zarr_dataset=True, zarr_path="/tmp/lafan1_dataset.zarr")
+print(loader.metadata)
+```
+
+To group multiple files as trajectories of the same motion (LocoMuJoCo-style motion grouping),
+use an explicit motion `name` with `paths`:
+
+```python
+cfg = {
+    "dataset": {
+        "trajectories": {
+            "lafan1_csv": [
+                {"name": "dance_combo", "paths": ["/data/dance_01.csv", "/data/dance_02.csv"]},
+                {"name": "walk_combo", "paths": ["/data/walk_01.csv", "/data/walk_02.csv"]},
+            ]
+        }
+    },
+    "control_freq": 50,
+}
+```
+
 ## Usage
 
 Here is an example of how to use the `TrajectoryDatasetManager` to load and step through a dataset, inspired by `tests/datasets/test_integration.py`.
