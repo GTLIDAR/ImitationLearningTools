@@ -1,7 +1,7 @@
 """Utilities to build replay buffers from Zarr datasets (Zarr v3+).
 
 Exports a Zarr trajectory dataset into a TorchRL TensorDictReplayBuffer backed by
-LazyTensorStorage (in-memory).
+LazyMemmapStorage (memmap on disk).
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import zarr
 from tensordict import TensorDict
-from torchrl.data import LazyTensorStorage
+from torchrl.data import LazyMemmapStorage
 from torchrl.data.replay_buffers import TensorDictReplayBuffer
 
 logger = logging.getLogger(f"{__name__}.utils")
@@ -94,9 +94,9 @@ def make_rb_from(
         datasets/motions/trajectories: selections within the Zarr hierarchy.
         keys: if None, use all array keys in each trajectory group. If provided,
               only those keys are loaded.
-        scratch_dir: unused, kept for API compatibility.
+        scratch_dir: directory for memmap files.
         device: torch device for tensors in the RB.
-        existsok/compilable: unused, kept for API compatibility.
+        existsok/compilable: passed to LazyMemmapStorage.
         verbose_tree: print zarr tree at start.
 
     Returns:
@@ -121,12 +121,11 @@ def make_rb_from(
         raise ValueError("Computed non-positive capacity; check selections/structure.")
 
     # 2) Storage + RB
-    # Use LazyTensorStorage (in-memory) instead of LazyMemmapStorage.
-    # LazyMemmapStorage uses MemoryMappedTensor files, and parallel index_put
-    # into those during extend() can trigger SIGBUS (bus error) on Linux.
-    storage = LazyTensorStorage(
+    storage = LazyMemmapStorage(
         capacity,
+        scratch_dir=None if scratch_dir is None else str(Path(scratch_dir)),
         device=device_t,
+        existsok=existsok,
         compilable=compilable,
     )
     rb = TensorDictReplayBuffer(
