@@ -358,7 +358,11 @@ class ParallelTrajectoryManager:
         return td
 
     def sample(
-        self, env_ids: Sequence[int] | Tensor | None = None, *, advance: bool = True
+        self,
+        env_ids: Sequence[int] | Tensor | None = None,
+        *,
+        advance: bool = True,
+        use_buffers: bool = False,
     ) -> TensorDict:
         """Sample one transition per env (or subset) via direct storage indexing."""
         if env_ids is None:
@@ -386,7 +390,6 @@ class ParallelTrajectoryManager:
             int(env_ids_t.numel()),
             advance,
         )
-        use_buffers = env_ids is None and td.batch_size == torch.Size([self.num_envs])
         return self._attach_reference_fields(td, traj_ranks=r, use_buffers=use_buffers)
 
     def sample_slice(
