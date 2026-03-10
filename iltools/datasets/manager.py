@@ -9,20 +9,96 @@ from tensordict import TensorDict
 from torch import Tensor
 from torchrl.data import TensorDictReplayBuffer
 
-from .utils import (
-    _map_reference_to_target,
-    get_ith_traj_info,
-    get_traj_rank_from_info,
-)
+from .utils import _map_reference_to_target, get_ith_traj_info
 
 logger = logging.getLogger(__name__)
+
+
+def _compile_if_available(fn: Callable):
+    if hasattr(torch, "compile"):
+        return torch.compile(fn)
+    return fn
+
+
+@_compile_if_available
+def _get_global_index_impl(
+    start_rank: Tensor, end_rank: Tensor, local_step: Tensor
+) -> Tensor:
+    return (start_rank + local_step).clamp(min=start_rank, max=end_rank - 1)
 
 
 def get_global_index(
     rank: Tensor, start: Tensor, end: Tensor, local_step: Tensor
 ) -> Tensor:
     """Vectorized map (traj_rank, local_step) -> global index in replay storage."""
-    return (start[rank] + local_step).clamp(min=start[rank], max=end[rank] - 1)
+    start_rank = start.index_select(0, rank)
+    end_rank = end.index_select(0, rank)
+    if local_step.ndim > 1:
+        view_shape = (start_rank.shape[0],) + (1,) * (local_step.ndim - 1)
+        start_rank = start_rank.view(view_shape)
+        end_rank = end_rank.view(view_shape)
+    return _get_global_index_impl(start_rank, end_rank, local_step)
+
+
+@_compile_if_available
+def _clamp_env_steps_impl(steps_t: Tensor, max_step: Tensor) -> Tensor:
+    return torch.minimum(steps_t.clamp(min=0), max_step)
+
+
+@_compile_if_available
+def _advance_steps_wrap_impl(step: Tensor, length: Tensor) -> Tensor:
+    return (step + 1) % length
+
+
+@_compile_if_available
+def _advance_steps_clamp_impl(step: Tensor, length: Tensor) -> Tensor:
+    return torch.minimum(step + 1, length - 1)
+
+
+@_compile_if_available
+def _make_contiguous_local_steps_impl(
+    start_steps: Tensor, step_offsets: Tensor, max_step: Tensor
+) -> Tensor:
+    return torch.minimum(
+        start_steps.unsqueeze(1) + step_offsets.unsqueeze(0),
+        max_step.unsqueeze(1),
+    )
+
+
+@_compile_if_available
+def _clamp_independent_local_steps_impl(
+    local_steps: Tensor, max_step: Tensor
+) -> Tensor:
+    return torch.minimum(local_steps.clamp(min=0), max_step.unsqueeze(1))
+
+
+@_compile_if_available
+def _extract_reference_fields_impl(
+    qpos: Tensor,
+    qvel: Tensor,
+    nan_joint_template: Tensor,
+    ref_to_target_map: Tensor,
+    target_to_ref_map: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    root_pos = qpos[..., 0:3]
+    root_quat = qpos[..., 3:7]
+    root_lin_vel = qvel[..., 0:3]
+    root_ang_vel = qvel[..., 3:6]
+    joint_pos_src = qpos[..., 7:].index_select(-1, target_to_ref_map)
+    joint_vel_src = qvel[..., 6:].index_select(-1, target_to_ref_map)
+    out_shape = qpos.shape[:-1] + (nan_joint_template.shape[-1],)
+    joint_pos_out = nan_joint_template.expand(out_shape).clone()
+    joint_vel_out = nan_joint_template.expand(out_shape).clone()
+    joint_pos_out[..., ref_to_target_map] = joint_pos_src
+    joint_vel_out[..., ref_to_target_map] = joint_vel_src
+    return (
+        root_pos,
+        root_quat,
+        root_lin_vel,
+        root_ang_vel,
+        joint_pos_out,
+        joint_vel_out,
+    )
 
 
 @dataclass(frozen=True)
@@ -74,11 +150,26 @@ class ParallelTrajectoryManager:
         self.num_envs = int(num_envs)
 
         self._device = torch.device(device) if device is not None else None
+        storage = getattr(self.rb, "_storage", None)
+        storage_device = getattr(storage, "device", None)
+        self._storage_device = (
+            torch.device(storage_device)
+            if storage_device is not None
+            else torch.device("cpu")
+        )
+        self._state_device = self._device or self._storage_device
 
-        # Trajectory layout (by rank)
         try:
-            start = torch.as_tensor(traj_info["start_index"], dtype=torch.int64)
-            end = torch.as_tensor(traj_info["end_index"], dtype=torch.int64)
+            start = torch.as_tensor(
+                traj_info["start_index"],
+                dtype=torch.int64,
+                device=self._state_device,
+            )
+            end = torch.as_tensor(
+                traj_info["end_index"],
+                dtype=torch.int64,
+                device=self._state_device,
+            )
             ordered = traj_info["ordered_traj_list"]
         except KeyError as e:
             raise KeyError(
@@ -94,16 +185,24 @@ class ParallelTrajectoryManager:
         self._end = end
         self._length = (end - start).clamp(min=0)
         self._ordered_traj_list = list(ordered)
+        self._traj_rank_lookup = {
+            traj: idx for idx, traj in enumerate(self._ordered_traj_list)
+        }
 
-        # Per-env state
-        self.env_traj_rank = torch.zeros((self.num_envs,), dtype=torch.int64)
-        self.env_step = torch.zeros((self.num_envs,), dtype=torch.int64)
+        self.env_traj_rank = torch.zeros(
+            (self.num_envs,), dtype=torch.int64, device=self._state_device
+        )
+        self.env_step = torch.zeros(
+            (self.num_envs,), dtype=torch.int64, device=self._state_device
+        )
+        self._all_env_ids = torch.arange(
+            self.num_envs, dtype=torch.int64, device=self._state_device
+        )
+        self._step_offsets_cache: dict[int, Tensor] = {}
 
-        # State for sequential scheduling
         self._next_rank = 0
 
-        # Initialize all envs
-        self.reset_envs(torch.arange(self.num_envs, dtype=torch.int64))
+        self.reset_envs(self._all_env_ids)
         logger.info(
             "Initialized ParallelTrajectoryManager(num_envs=%s, num_trajectories=%s, reset_schedule=%s, reset_start_step=%s)",
             self.num_envs,
@@ -112,27 +211,47 @@ class ParallelTrajectoryManager:
             self.reset_start_step,
         )
 
-        # Get the mapping from reference to target joint names
         self.ref_to_target_map, self.target_to_ref_map = _map_reference_to_target(
-            reference_joint_names, target_joint_names, self._device
+            reference_joint_names,
+            target_joint_names,
+            self._state_device,
         )
         self._num_target_joints = len(target_joint_names)
         self.target_mask = torch.zeros(
-            self._num_target_joints, dtype=torch.bool, device=self._device
+            self._num_target_joints, dtype=torch.bool, device=self._state_device
         )
         self.target_mask[self.ref_to_target_map] = True
+        self._nan_joint_template = torch.full(
+            (1, self._num_target_joints),
+            torch.nan,
+            dtype=torch.float32,
+            device=self._state_device,
+        )
 
-        # Memory allocate for important data
         self.joint_pos = torch.empty(
-            num_envs, self._num_target_joints, device=device, dtype=torch.float32
+            self.num_envs,
+            self._num_target_joints,
+            device=self._state_device,
+            dtype=torch.float32,
         )
         self.joint_vel = torch.empty(
-            num_envs, self._num_target_joints, device=device, dtype=torch.float32
+            self.num_envs,
+            self._num_target_joints,
+            device=self._state_device,
+            dtype=torch.float32,
         )
-        self.root_pos = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
-        self.root_quat = torch.empty(num_envs, 4, device=device, dtype=torch.float32)
-        self.root_lin_vel = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
-        self.root_ang_vel = torch.empty(num_envs, 3, device=device, dtype=torch.float32)
+        self.root_pos = torch.empty(
+            self.num_envs, 3, device=self._state_device, dtype=torch.float32
+        )
+        self.root_quat = torch.empty(
+            self.num_envs, 4, device=self._state_device, dtype=torch.float32
+        )
+        self.root_lin_vel = torch.empty(
+            self.num_envs, 3, device=self._state_device, dtype=torch.float32
+        )
+        self.root_ang_vel = torch.empty(
+            self.num_envs, 3, device=self._state_device, dtype=torch.float32
+        )
 
     @property
     def num_trajectories(self) -> int:
@@ -144,15 +263,8 @@ class ParallelTrajectoryManager:
         return get_ith_traj_info(r, self._ordered_traj_list)  # type: ignore[arg-type]
 
     def get_traj_rank(self, dataset: str, motion: str, trajectory: str) -> int:
-        """Map (dataset,motion,trajectory) to trajectory rank using utils.py logic."""
-        return int(
-            get_traj_rank_from_info(
-                dataset,
-                motion,
-                trajectory,
-                self._ordered_traj_list,  # type: ignore[arg-type]
-            )
-        )
+        """Map (dataset,motion,trajectory) to trajectory rank."""
+        return self._traj_rank_lookup[(dataset, motion, trajectory)]
 
     def _normalize_env_ids(self, env_ids: Sequence[int] | Tensor) -> Tensor:
         env_ids_t = (
@@ -160,7 +272,16 @@ class ParallelTrajectoryManager:
             if isinstance(env_ids, torch.Tensor)
             else torch.as_tensor(list(env_ids), dtype=torch.int64)
         )
-        return env_ids_t.to(device=self.env_traj_rank.device, dtype=torch.int64)
+        return env_ids_t.to(device=self._state_device, dtype=torch.int64)
+
+    def _get_step_offsets(self, batch_size: int) -> Tensor:
+        step_offsets = self._step_offsets_cache.get(batch_size)
+        if step_offsets is None:
+            step_offsets = torch.arange(
+                batch_size, dtype=torch.int64, device=self._state_device
+            )
+            self._step_offsets_cache[batch_size] = step_offsets
+        return step_offsets
 
     def _choose_new_ranks(self, env_ids: Tensor) -> Tensor:
         env_ids = self._normalize_env_ids(env_ids)
@@ -186,9 +307,7 @@ class ParallelTrajectoryManager:
             return ranks
 
         if self.reset_schedule == ResetSchedule.ROUND_ROBIN:
-            # Cycle each env independently: next = (current + 1) % N
-            cur = self.env_traj_rank[env_ids]
-            return (cur + 1) % self.num_trajectories
+            return (self.env_traj_rank[env_ids] + 1) % self.num_trajectories
 
         if self.reset_schedule == ResetSchedule.CUSTOM:
             if self.custom_reset_fn is None:
@@ -233,12 +352,14 @@ class ParallelTrajectoryManager:
             self._set_env_steps(env_ids_t, self.reset_start_step)
         else:
             self._set_env_steps(env_ids_t, steps)
-        logger.debug(
-            "Reset envs %s -> ranks %s, start_steps %s",
-            env_ids_t.tolist(),
-            new_ranks.tolist(),
-            self.env_step[env_ids_t].tolist(),
-        )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Reset envs %s -> ranks %s, start_steps %s",
+                env_ids_t.tolist(),
+                new_ranks.tolist(),
+                self.env_step[env_ids_t].tolist(),
+            )
 
     def set_env_cursor(
         self,
@@ -267,55 +388,39 @@ class ParallelTrajectoryManager:
             steps_t = torch.as_tensor(steps, dtype=torch.int64, device=env_ids_t.device)
             if steps_t.shape != env_ids_t.shape:
                 raise ValueError("steps must have the same shape as env_ids")
-        # Clamp into valid range for each env's trajectory
-        r = self.env_traj_rank[env_ids_t]
-        max_step = (self._length[r] - 1).clamp(min=0)
-        self.env_step[env_ids_t] = torch.minimum(steps_t.clamp(min=0), max_step)
+        max_step = (self._length[self.env_traj_rank[env_ids_t]] - 1).clamp(min=0)
+        self.env_step[env_ids_t] = _clamp_env_steps_impl(steps_t, max_step)
 
-    def _attach_reference_fields(
-        self, td: TensorDict, traj_ranks: Tensor, *, use_buffers: bool
-    ) -> TensorDict:
+    def _attach_reference_fields(self, td: TensorDict, *, use_buffers: bool) -> TensorDict:
         qpos = td.get("qpos")
         qvel = td.get("qvel")
         assert qpos is not None and qvel is not None, (
             "qpos and qvel must be present in the reference data"
         )
 
-        traj_ranks = torch.as_tensor(
-            traj_ranks, dtype=torch.int64, device=self._start.device
+        (
+            root_pos,
+            root_quat,
+            root_lin_vel,
+            root_ang_vel,
+            joint_pos_out,
+            joint_vel_out,
+        ) = _extract_reference_fields_impl(
+            qpos,
+            qvel,
+            self._nan_joint_template.to(device=qpos.device, dtype=qpos.dtype),
+            self.ref_to_target_map,
+            self.target_to_ref_map,
         )
-        start_idx = self._start[traj_ranks]
-        start_td = self.rb[start_idx]
-        if self._device is not None:
-            start_td = start_td.to(self._device)
-        start_qpos = start_td.get("qpos")
-        assert start_qpos is not None, "qpos must be present in the reference data"
+        self.root_qpos = root_pos
 
-        root_pos = qpos[..., 0:3]
-        root_quat = qpos[..., 3:7]
-        # Keep root velocities in the same trajectory-local frame as root pose/quat.
-        # This avoids frame-mismatch when replay/reward code later rotates references
-        # by the reset-frame orientation.
-        root_lin_vel = qvel[..., 0:3]
-        root_ang_vel = qvel[..., 3:6]
-
-        if use_buffers:
+        if use_buffers and qpos.ndim == 2 and qpos.shape[0] == self.num_envs:
             self.root_pos.copy_(root_pos)
             self.root_quat.copy_(root_quat)
             self.root_lin_vel.copy_(root_lin_vel)
             self.root_ang_vel.copy_(root_ang_vel)
-            self.root_qpos = self.root_pos
-
-            joint_pos = qpos[..., 7:]
-            joint_vel = qvel[..., 6:]
-            self.joint_pos[..., self.ref_to_target_map] = joint_pos[
-                ..., self.target_to_ref_map
-            ]
-            self.joint_vel[..., self.ref_to_target_map] = joint_vel[
-                ..., self.target_to_ref_map
-            ]
-            self.joint_pos[..., ~self.target_mask] = torch.nan
-            self.joint_vel[..., ~self.target_mask] = torch.nan
+            self.joint_pos.copy_(joint_pos_out)
+            self.joint_vel.copy_(joint_vel_out)
 
             td.set(key="root_pos", item=self.root_pos)
             td.set(key="root_quat", item=self.root_quat)
@@ -324,30 +429,6 @@ class ParallelTrajectoryManager:
             td.set(key="joint_pos", item=self.joint_pos)
             td.set(key="joint_vel", item=self.joint_vel)
             return td
-
-        self.root_qpos = root_pos
-
-        batch_shape = td.batch_size
-        joint_pos_out = torch.full(
-            batch_shape + (self._num_target_joints,),
-            torch.nan,
-            device=qpos.device,
-            dtype=qpos.dtype,
-        )
-        joint_vel_out = torch.full(
-            batch_shape + (self._num_target_joints,),
-            torch.nan,
-            device=qpos.device,
-            dtype=qpos.dtype,
-        )
-        joint_pos = qpos[..., 7:]
-        joint_vel = qvel[..., 6:]
-        joint_pos_out[..., self.ref_to_target_map] = joint_pos[
-            ..., self.target_to_ref_map
-        ]
-        joint_vel_out[..., self.ref_to_target_map] = joint_vel[
-            ..., self.target_to_ref_map
-        ]
 
         td.set(key="root_pos", item=root_pos)
         td.set(key="root_quat", item=root_quat)
@@ -365,32 +446,25 @@ class ParallelTrajectoryManager:
         use_buffers: bool = False,
     ) -> TensorDict:
         """Sample one transition per env (or subset) via direct storage indexing."""
-        if env_ids is None:
-            env_ids_t = torch.arange(
-                self.num_envs, dtype=torch.int64, device=self.env_traj_rank.device
-            )
-        else:
-            env_ids_t = self._normalize_env_ids(env_ids)
+        env_ids_t = self._all_env_ids if env_ids is None else self._normalize_env_ids(env_ids)
 
         r = self.env_traj_rank[env_ids_t]
         step = self.env_step[env_ids_t]
-
         idx = get_global_index(r, self._start, self._end, step)
 
-        # Direct indexing into storage (fast path)
         td = self.rb[idx]
-
         if self._device is not None:
             td = td.to(self._device)
 
         if advance:
             self._advance_steps(env_ids_t)
+
         logger.debug(
             "Sampled %s envs (advance=%s)",
             int(env_ids_t.numel()),
             advance,
         )
-        return self._attach_reference_fields(td, traj_ranks=r, use_buffers=use_buffers)
+        return self._attach_reference_fields(td, use_buffers=use_buffers)
 
     def sample_slice(
         self,
@@ -410,15 +484,13 @@ class ParallelTrajectoryManager:
             raise ValueError("batch_size must be positive")
         if mode not in {"contiguous", "independent"}:
             raise ValueError("mode must be 'contiguous' or 'independent'")
-        if env_ids is None:
-            env_ids_t = torch.arange(
-                self.num_envs, dtype=torch.int64, device=self.env_traj_rank.device
-            )
-        else:
-            env_ids_t = self._normalize_env_ids(env_ids)
+
+        env_ids_t = self._all_env_ids if env_ids is None else self._normalize_env_ids(env_ids)
 
         r = self.env_traj_rank[env_ids_t]
         length = self._length[r].clamp(min=1)
+        max_step = length - 1
+
         if mode == "contiguous":
             if torch.any(length < batch_size):
                 logger.warning(
@@ -432,15 +504,18 @@ class ParallelTrajectoryManager:
                     rand * (max_start.to(dtype=rand.dtype) + 1)
                 ).to(dtype=torch.int64)
             else:
-                start_steps_t = torch.as_tensor(start_steps, dtype=torch.int64)
+                start_steps_t = torch.as_tensor(
+                    start_steps, dtype=torch.int64, device=env_ids_t.device
+                )
                 if start_steps_t.shape != env_ids_t.shape:
                     raise ValueError("start_steps must have the same shape as env_ids")
-                start_steps_t = start_steps_t.to(device=env_ids_t.device).clamp(min=0)
-            start_steps_t = torch.minimum(start_steps_t, length - 1)
-            step_offsets = torch.arange(
-                batch_size, dtype=torch.int64, device=start_steps_t.device
-            ).unsqueeze(0)
-            local_steps = start_steps_t.unsqueeze(1) + step_offsets
+                start_steps_t = start_steps_t.clamp(min=0)
+            start_steps_t = torch.minimum(start_steps_t, max_step)
+            local_steps = _make_contiguous_local_steps_impl(
+                start_steps_t,
+                self._get_step_offsets(batch_size),
+                max_step,
+            )
         else:
             if start_steps is None:
                 rand = torch.rand(
@@ -452,26 +527,21 @@ class ParallelTrajectoryManager:
                     rand * length.to(dtype=rand.dtype).unsqueeze(1)
                 ).to(dtype=torch.int64)
             else:
-                start_steps_t = torch.as_tensor(start_steps, dtype=torch.int64).to(
-                    device=env_ids_t.device
+                start_steps_t = torch.as_tensor(
+                    start_steps, dtype=torch.int64, device=env_ids_t.device
                 )
                 if start_steps_t.shape == env_ids_t.shape:
                     local_steps = start_steps_t.unsqueeze(1).expand(-1, batch_size)
-                elif start_steps_t.shape == (
-                    int(env_ids_t.numel()),
-                    batch_size,
-                ):
+                elif start_steps_t.shape == (int(env_ids_t.numel()), batch_size):
                     local_steps = start_steps_t
                 else:
                     raise ValueError(
                         "start_steps must have shape [num_envs] or [num_envs, batch_size] for mode='independent'"
                     )
-            local_steps = local_steps.clamp(min=0)
-            local_steps = torch.minimum(local_steps, length.unsqueeze(1) - 1)
+            local_steps = _clamp_independent_local_steps_impl(local_steps, max_step)
 
         idx = get_global_index(r, self._start, self._end, local_steps)
         td = self.rb[idx]
-
         if self._device is not None:
             td = td.to(self._device)
 
@@ -484,16 +554,14 @@ class ParallelTrajectoryManager:
             mode,
             advance,
         )
-
-        return self._attach_reference_fields(td, traj_ranks=r, use_buffers=False)
+        return self._attach_reference_fields(td, use_buffers=False)
 
     def _advance_steps(self, env_ids: Tensor) -> None:
         env_ids = self._normalize_env_ids(env_ids)
-        r = self.env_traj_rank[env_ids]
-        length = self._length[r].clamp(min=1)  # avoid div-by-zero
+        length = self._length[self.env_traj_rank[env_ids]].clamp(min=1)
         step = self.env_step[env_ids]
 
         if self.wrap_steps:
-            self.env_step[env_ids] = (step + 1) % length
+            self.env_step[env_ids] = _advance_steps_wrap_impl(step, length)
         else:
-            self.env_step[env_ids] = torch.minimum(step + 1, length - 1)
+            self.env_step[env_ids] = _advance_steps_clamp_impl(step, length)

@@ -1,7 +1,7 @@
 """Utilities to build replay buffers from Zarr datasets (Zarr v3+).
 
 Exports a Zarr trajectory dataset into a TorchRL TensorDictReplayBuffer backed by
-LazyMemmapStorage (memmap on disk).
+LazyMemmapStorage on CPU or LazyTensorStorage on CUDA.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import zarr
 from tensordict import TensorDict
-from torchrl.data import LazyMemmapStorage
+from torchrl.data import LazyMemmapStorage, LazyTensorStorage
 from torchrl.data.replay_buffers import TensorDictReplayBuffer
 
 logger = logging.getLogger(f"{__name__}.utils")
@@ -86,6 +86,7 @@ def make_rb_from(
     verbose_tree: bool = True,
     pin_memory: bool = True,
     prefetch: int = 0,
+    batch_size: int = 1,
 ) -> tuple[TensorDictReplayBuffer, dict]:
     """Build a TorchRL replay buffer from a Zarr trajectory dataset.
 
@@ -94,9 +95,9 @@ def make_rb_from(
         datasets/motions/trajectories: selections within the Zarr hierarchy.
         keys: if None, use all array keys in each trajectory group. If provided,
               only those keys are loaded.
-        scratch_dir: directory for memmap files.
+        scratch_dir: directory for memmap files when using CPU storage.
         device: torch device for tensors in the RB.
-        existsok/compilable: passed to LazyMemmapStorage.
+        existsok/compilable: passed to the underlying TorchRL storage.
         verbose_tree: print zarr tree at start.
 
     Returns:
@@ -121,15 +122,22 @@ def make_rb_from(
         raise ValueError("Computed non-positive capacity; check selections/structure.")
 
     # 2) Storage + RB
-    storage = LazyMemmapStorage(
-        capacity,
-        scratch_dir=None if scratch_dir is None else str(Path(scratch_dir)),
-        device=device_t,
-        existsok=existsok,
-        compilable=compilable,
-    )
+    if device_t.type == "cuda":
+        storage = LazyTensorStorage(
+            capacity,
+            device=device_t,
+            compilable=compilable,
+        )
+    else:
+        storage = LazyMemmapStorage(
+            capacity,
+            scratch_dir=None if scratch_dir is None else str(Path(scratch_dir)),
+            device=device_t,
+            existsok=existsok,
+            compilable=compilable,
+        )
     rb = TensorDictReplayBuffer(
-        storage=storage, pin_memory=pin_memory, prefetch=prefetch
+        storage=storage, pin_memory=pin_memory, prefetch=prefetch, batch_size=batch_size
     )
 
     # 3) Fill
