@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 import torch
 from tensordict import TensorDict
@@ -62,6 +63,50 @@ def _make_step_rb_and_traj_info(tmp_path, lengths=(5, 6), num_joints=2):
                 "done": torch.zeros((L, 1), dtype=torch.bool),
                 "qpos": qpos,
                 "qvel": qvel,
+            },
+            batch_size=[L],
+        )
+        rb.extend(td)
+        start.append(offset)
+        offset += L
+        end.append(offset)
+        ordered.append(("ds", "m", f"t{i}"))
+
+    traj_info = {"start_index": start, "end_index": end, "ordered_traj_list": ordered}
+    return rb, traj_info
+
+
+def _make_transition_step_rb_and_traj_info(tmp_path, lengths=(5, 6), num_joints=2):
+    total = sum(lengths)
+    storage = LazyMemmapStorage(
+        total, scratch_dir=str(tmp_path), device="cpu", existsok=True
+    )
+    rb = TensorDictReplayBuffer(storage=storage)
+
+    start = []
+    end = []
+    ordered = []
+    offset = 0
+    for i, L in enumerate(lengths):
+        steps = torch.arange(L, dtype=torch.float32)
+        obs = (steps + i * 100.0).unsqueeze(1)
+        qpos = torch.zeros((L, 7 + num_joints), dtype=torch.float32)
+        qvel = torch.zeros((L, 6 + num_joints), dtype=torch.float32)
+        next_qpos = torch.zeros((L, 7 + num_joints), dtype=torch.float32)
+        next_qvel = torch.zeros((L, 6 + num_joints), dtype=torch.float32)
+        for joint_idx in range(num_joints):
+            qpos[:, 7 + joint_idx] = steps + float(joint_idx) * 0.1 + i * 100.0
+            qvel[:, 6 + joint_idx] = 10.0 + steps + float(joint_idx) + i * 100.0
+            next_qpos[:, 7 + joint_idx] = steps + 1.0 + float(joint_idx) * 0.1 + i * 100.0
+            next_qvel[:, 6 + joint_idx] = 20.0 + steps + float(joint_idx) + i * 100.0
+        td = TensorDict(
+            {
+                "obs": obs,
+                "done": torch.zeros((L, 1), dtype=torch.bool),
+                "qpos": qpos,
+                "qvel": qvel,
+                "next_qpos": next_qpos,
+                "next_qvel": next_qvel,
             },
             batch_size=[L],
         )
@@ -177,6 +222,46 @@ def test_parallel_trajectory_manager_sample_slice_modes(tmp_path):
     obs_contig = td_contig["obs"].squeeze(-1)
     expected_contig = torch.tensor([[2.0, 3.0, 4.0], [101.0, 102.0, 103.0]])
     assert torch.allclose(obs_contig, expected_contig)
+
+
+def test_parallel_trajectory_manager_materializes_aligned_next_fields(tmp_path):
+    from iltools.datasets.manager import ParallelTrajectoryManager, ResetSchedule
+
+    rb, traj_info = _make_transition_step_rb_and_traj_info(tmp_path, lengths=(5, 6))
+    mgr = ParallelTrajectoryManager(
+        rb=rb,
+        traj_info=traj_info,
+        num_envs=2,
+        reset_schedule=ResetSchedule.RANDOM,
+        target_joint_names=["joint1", "joint2"],
+        reference_joint_names=["joint1", "joint2"],
+    )
+    mgr.set_env_cursor(env_ids=[0, 1], ranks=torch.tensor([0, 1]))
+
+    start_steps = torch.tensor([1, 2])
+    td = mgr.sample_slice(
+        batch_size=2,
+        env_ids=[0, 1],
+        start_steps=start_steps,
+        mode="contiguous",
+    )
+
+    joint_pos = td["joint_pos"]
+    next_joint_pos = td.get(("next", "joint_pos"))
+    next_joint_vel = td.get(("next", "joint_vel"))
+
+    assert next_joint_pos is not None
+    assert next_joint_vel is not None
+    np.testing.assert_allclose(
+        next_joint_pos[..., 0].cpu().numpy(),
+        (joint_pos[..., 0] + 1.0).cpu().numpy(),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        next_joint_vel[..., 0].cpu().numpy(),
+        np.array([[21.0, 22.0], [122.0, 123.0]], dtype=np.float32),
+        atol=1e-6,
+    )
 
 
 def test_parallel_trajectory_manager_root_pose_is_relative_to_first_step(tmp_path):

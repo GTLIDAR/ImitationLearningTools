@@ -20,6 +20,11 @@ from torchrl.data.replay_buffers import TensorDictReplayBuffer
 logger = logging.getLogger(f"{__name__}.utils")
 
 
+def _is_transition_aligned_key(key: str) -> bool:
+    """Return True when a stored key is already aligned to transition length T-1."""
+    return key in {"obs", "next_obs", "done", "absorbing"} or key.startswith("next_")
+
+
 def _zarr_array_to_torch(
     arr: np.ndarray,
     *,
@@ -188,7 +193,7 @@ def make_rb_from(
                             f"Key '{k}' not found in {dataset}/{motion}/{trajectory}. "
                             f"Available: {list(traj_grp.array_keys())}"
                         )
-                    if k not in ["obs", "next_obs", "done", "absorbing"]:
+                    if not _is_transition_aligned_key(k):
                         np_data = traj_grp[k][
                             :-1
                         ]  # discard the last step for non-transition data

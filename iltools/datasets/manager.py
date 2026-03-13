@@ -140,6 +140,8 @@ class ParallelTrajectoryManager:
         self.traj_info = traj_info
         self.reset_schedule = reset_schedule
         self.custom_reset_fn = custom_reset_fn
+        self.reference_joint_names = list(reference_joint_names or [])
+        self.target_joint_names = list(target_joint_names or [])
         if int(reset_start_step) < 0:
             raise ValueError("reset_start_step must be >= 0")
         self.reset_start_step = int(reset_start_step)
@@ -188,6 +190,8 @@ class ParallelTrajectoryManager:
         self._traj_rank_lookup = {
             traj: idx for idx, traj in enumerate(self._ordered_traj_list)
         }
+        sample_keys = {str(key) for key in self.rb[0].keys()}
+        self.has_next_reference = "next_qpos" in sample_keys and "next_qvel" in sample_keys
 
         self.env_traj_rank = torch.zeros(
             (self.num_envs,), dtype=torch.int64, device=self._state_device
@@ -201,6 +205,7 @@ class ParallelTrajectoryManager:
         self._step_offsets_cache: dict[int, Tensor] = {}
 
         self._next_rank = 0
+        self._reconstructed_action_targets: Tensor | None = None
 
         self.reset_envs(self._all_env_ids)
         logger.info(
@@ -212,11 +217,11 @@ class ParallelTrajectoryManager:
         )
 
         self.ref_to_target_map, self.target_to_ref_map = _map_reference_to_target(
-            reference_joint_names,
-            target_joint_names,
+            self.reference_joint_names,
+            self.target_joint_names,
             self._state_device,
         )
-        self._num_target_joints = len(target_joint_names)
+        self._num_target_joints = len(self.target_joint_names)
         self.target_mask = torch.zeros(
             self._num_target_joints, dtype=torch.bool, device=self._state_device
         )
@@ -256,6 +261,10 @@ class ParallelTrajectoryManager:
     @property
     def num_trajectories(self) -> int:
         return int(self._start.numel())
+
+    @property
+    def storage_device(self) -> torch.device:
+        return self._storage_device
 
     def get_env_traj_info(self, env_id: int) -> tuple[str, str, str]:
         """Return (dataset, motion, trajectory) tuple for the env's current rank."""
@@ -391,12 +400,19 @@ class ParallelTrajectoryManager:
         max_step = (self._length[self.env_traj_rank[env_ids_t]] - 1).clamp(min=0)
         self.env_step[env_ids_t] = _clamp_env_steps_impl(steps_t, max_step)
 
-    def _attach_reference_fields(self, td: TensorDict, *, use_buffers: bool) -> TensorDict:
-        qpos = td.get("qpos")
-        qvel = td.get("qvel")
-        assert qpos is not None and qvel is not None, (
-            "qpos and qvel must be present in the reference data"
-        )
+    def _set_reference_fields(
+        self,
+        td: TensorDict,
+        *,
+        qpos_key: str,
+        qvel_key: str,
+        output_prefix: tuple[str, ...],
+        use_buffers: bool,
+    ) -> None:
+        qpos = td.get(qpos_key)
+        qvel = td.get(qvel_key)
+        if qpos is None or qvel is None:
+            return
 
         (
             root_pos,
@@ -409,12 +425,21 @@ class ParallelTrajectoryManager:
             qpos,
             qvel,
             self._nan_joint_template.to(device=qpos.device, dtype=qpos.dtype),
-            self.ref_to_target_map,
-            self.target_to_ref_map,
+            self.ref_to_target_map.to(device=qpos.device),
+            self.target_to_ref_map.to(device=qpos.device),
         )
-        self.root_qpos = root_pos
+        make_key = (
+            (lambda name: name)
+            if len(output_prefix) == 0
+            else (lambda name: (*output_prefix, name))
+        )
 
-        if use_buffers and qpos.ndim == 2 and qpos.shape[0] == self.num_envs:
+        if (
+            not output_prefix
+            and use_buffers
+            and qpos.ndim == 2
+            and qpos.shape[0] == self.num_envs
+        ):
             self.root_pos.copy_(root_pos)
             self.root_quat.copy_(root_quat)
             self.root_lin_vel.copy_(root_lin_vel)
@@ -422,21 +447,87 @@ class ParallelTrajectoryManager:
             self.joint_pos.copy_(joint_pos_out)
             self.joint_vel.copy_(joint_vel_out)
 
-            td.set(key="root_pos", item=self.root_pos)
-            td.set(key="root_quat", item=self.root_quat)
-            td.set(key="root_lin_vel", item=self.root_lin_vel)
-            td.set(key="root_ang_vel", item=self.root_ang_vel)
-            td.set(key="joint_pos", item=self.joint_pos)
-            td.set(key="joint_vel", item=self.joint_vel)
-            return td
+            td.set("root_pos", self.root_pos)
+            td.set("root_quat", self.root_quat)
+            td.set("root_lin_vel", self.root_lin_vel)
+            td.set("root_ang_vel", self.root_ang_vel)
+            td.set("joint_pos", self.joint_pos)
+            td.set("joint_vel", self.joint_vel)
+            return
 
-        td.set(key="root_pos", item=root_pos)
-        td.set(key="root_quat", item=root_quat)
-        td.set(key="root_lin_vel", item=root_lin_vel)
-        td.set(key="root_ang_vel", item=root_ang_vel)
-        td.set(key="joint_pos", item=joint_pos_out)
-        td.set(key="joint_vel", item=joint_vel_out)
+        td.set(make_key("root_pos"), root_pos)
+        td.set(make_key("root_quat"), root_quat)
+        td.set(make_key("root_lin_vel"), root_lin_vel)
+        td.set(make_key("root_ang_vel"), root_ang_vel)
+        td.set(make_key("joint_pos"), joint_pos_out)
+        td.set(make_key("joint_vel"), joint_vel_out)
+
+    def _attach_reference_fields(self, td: TensorDict, *, use_buffers: bool) -> TensorDict:
+        if td.get("qpos") is None or td.get("qvel") is None:
+            raise AssertionError("qpos and qvel must be present in the reference data")
+
+        self._set_reference_fields(
+            td,
+            qpos_key="qpos",
+            qvel_key="qvel",
+            output_prefix=(),
+            use_buffers=use_buffers,
+        )
+        if self.has_next_reference:
+            self._set_reference_fields(
+                td,
+                qpos_key="next_qpos",
+                qvel_key="next_qvel",
+                output_prefix=("next",),
+                use_buffers=False,
+            )
         return td
+
+    def set_reconstructed_action_targets(self, action_targets: Tensor | None) -> None:
+        """Register cached reconstructed action targets in target-joint order."""
+        self._reconstructed_action_targets = action_targets
+
+    def get_reconstructed_action_targets(self, global_indices: Tensor) -> Tensor | None:
+        """Fetch cached reconstructed action targets for replay-buffer indices."""
+        if self._reconstructed_action_targets is None:
+            return None
+        index = torch.as_tensor(
+            global_indices,
+            dtype=torch.int64,
+            device=self._reconstructed_action_targets.device,
+        )
+        return self._reconstructed_action_targets.index_select(0, index.reshape(-1)).reshape(
+            index.shape + (self._reconstructed_action_targets.shape[-1],)
+        )
+
+    def sample_random_transitions(
+        self,
+        batch_size: int,
+    ) -> tuple[TensorDict, Tensor, Tensor]:
+        """Sample random transitions without advancing any environment cursor."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0.")
+
+        env_ids_tm = torch.randint(
+            low=0,
+            high=self.num_envs,
+            size=(batch_size,),
+            device=self._state_device,
+            dtype=torch.int64,
+        )
+        traj_ranks = self.env_traj_rank[env_ids_tm]
+        lengths = self._length[traj_ranks].clamp(min=1)
+        random_steps = torch.floor(
+            torch.rand(batch_size, device=self._state_device)
+            * lengths.to(dtype=torch.float32)
+        ).to(dtype=torch.int64)
+        global_indices = get_global_index(traj_ranks, self._start, self._end, random_steps)
+
+        reference = self.rb[global_indices.to(device=self._storage_device)]
+        if self._device is not None:
+            reference = reference.to(self._device)
+        reference = self._attach_reference_fields(reference, use_buffers=False)
+        return reference, env_ids_tm, global_indices
 
     def sample(
         self,
@@ -452,7 +543,7 @@ class ParallelTrajectoryManager:
         step = self.env_step[env_ids_t]
         idx = get_global_index(r, self._start, self._end, step)
 
-        td = self.rb[idx]
+        td = self.rb[idx.to(device=self._storage_device)]
         if self._device is not None:
             td = td.to(self._device)
 
@@ -541,7 +632,7 @@ class ParallelTrajectoryManager:
             local_steps = _clamp_independent_local_steps_impl(local_steps, max_step)
 
         idx = get_global_index(r, self._start, self._end, local_steps)
-        td = self.rb[idx]
+        td = self.rb[idx.to(device=self._storage_device)]
         if self._device is not None:
             td = td.to(self._device)
 

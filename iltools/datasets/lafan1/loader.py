@@ -28,6 +28,18 @@ BASE_EXPORT_KEYS: frozenset[str] = frozenset(
         "joint_vel",
     ]
 )
+TRANSITION_EXPORT_KEYS: frozenset[str] = frozenset(
+    [
+        "next_qpos",
+        "next_qvel",
+        "next_root_pos",
+        "next_root_quat",
+        "next_root_lin_vel",
+        "next_root_ang_vel",
+        "next_joint_pos",
+        "next_joint_vel",
+    ]
+)
 OPTIONAL_BODY_KEYS: frozenset[str] = frozenset(
     ["body_pos_w", "body_quat_w", "body_lin_vel_w", "body_ang_vel_w"]
 )
@@ -213,7 +225,7 @@ class Lafan1CsvLoader(BaseLoader):
 
         source_entries = self._collect_source_entries()
         self.motion_sources = self._resolve_motion_sources(source_entries)
-        self._available_keys: set[str] = set(BASE_EXPORT_KEYS)
+        self._available_keys: set[str] = set(BASE_EXPORT_KEYS | TRANSITION_EXPORT_KEYS)
         num_motion_groups = len({s.motion_name for s in self.motion_sources})
         self.logger.info(
             "Initializing Lafan1CsvLoader with %d source trajectories across %d motion groups",
@@ -583,6 +595,8 @@ class Lafan1CsvLoader(BaseLoader):
             dataset_group.attrs["site_names"] = self._site_names or []
             dataset_group.attrs["dt"] = self.control_dt
             dataset_group.attrs["control_freq"] = self.control_freq
+            dataset_group.attrs["transition_format"] = "flat_next_keys_v1"
+            dataset_group.attrs["transition_keys"] = sorted(TRANSITION_EXPORT_KEYS)
             dataset_group.attrs["trajectory_info_list"] = trajectory_info_list
             dataset_group.attrs["motion_info_dict"] = motion_info_dict
             self.logger.info("Saved trajectories to Zarr store at %s", path)
@@ -889,6 +903,14 @@ class Lafan1CsvLoader(BaseLoader):
             "root_ang_vel": root_ang_vel.astype(np.float32),
             "joint_pos": joint_pos.astype(np.float32),
             "joint_vel": joint_vel.astype(np.float32),
+            "next_qpos": qpos[1:].astype(np.float32),
+            "next_qvel": qvel[1:].astype(np.float32),
+            "next_root_pos": root_pos[1:].astype(np.float32),
+            "next_root_quat": root_quat[1:].astype(np.float32),
+            "next_root_lin_vel": root_lin_vel[1:].astype(np.float32),
+            "next_root_ang_vel": root_ang_vel[1:].astype(np.float32),
+            "next_joint_pos": joint_pos[1:].astype(np.float32),
+            "next_joint_vel": joint_vel[1:].astype(np.float32),
         }
 
         if extra_data is not None:

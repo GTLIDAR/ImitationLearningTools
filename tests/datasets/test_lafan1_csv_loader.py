@@ -7,6 +7,7 @@ import zarr
 from zarr.storage import LocalStore
 
 from iltools.datasets.lafan1.loader import Lafan1CsvLoader
+from iltools.datasets.utils import make_rb_from
 
 
 def _write_motion_csv(path: Path, *, frames: int = 12, joints: int = 4) -> None:
@@ -100,13 +101,52 @@ def test_lafan1_csv_loader_writes_zarr(tmp_path: Path) -> None:
     traj_group = dataset_group["dance_a"]["trajectory_0"]
     assert "qpos" in traj_group
     assert "qvel" in traj_group
+    assert "next_qpos" in traj_group
+    assert "next_qvel" in traj_group
     qpos = np.asarray(traj_group["qpos"][:])
     qvel = np.asarray(traj_group["qvel"][:])
+    next_qpos = np.asarray(traj_group["next_qpos"][:])
+    next_qvel = np.asarray(traj_group["next_qvel"][:])
     assert qpos.ndim == 2
     assert qvel.ndim == 2
     assert qpos.shape[0] == qvel.shape[0]
+    assert next_qpos.shape[0] == qpos.shape[0] - 1
+    assert next_qvel.shape[0] == qvel.shape[0] - 1
+    np.testing.assert_allclose(next_qpos, qpos[1:], atol=1e-6)
+    np.testing.assert_allclose(next_qvel, qvel[1:], atol=1e-6)
     assert qpos.shape[1] == 10  # 7 root + 3 joints
+    assert dataset_group.attrs["transition_format"] == "flat_next_keys_v1"
+    assert "next_qpos" in dataset_group.attrs["transition_keys"]
     assert len(loader.trajectory_info_list) == 2
+
+
+def test_lafan1_csv_loader_make_rb_preserves_transition_alignment(tmp_path: Path) -> None:
+    csv_a = tmp_path / "sequence_a.csv"
+    csv_b = tmp_path / "sequence_b.csv"
+    _write_motion_csv(csv_a, frames=12, joints=3)
+    _write_motion_csv(csv_b, frames=10, joints=3)
+
+    zarr_path = tmp_path / "lafan1_transitions.zarr"
+    cfg = {
+        "dataset": {"trajectories": {"lafan1_csv": [str(csv_a), str(csv_b)]}},
+        "input_fps": 60,
+        "control_freq": 60,
+    }
+    _ = Lafan1CsvLoader(cfg=cfg, build_zarr_dataset=True, zarr_path=str(zarr_path))
+
+    rb, info = make_rb_from(zarr_path=zarr_path, device="cpu", verbose_tree=False)
+    assert info["written"] == (12 - 1) + (10 - 1)
+
+    first = rb[0]
+    store = LocalStore(str(zarr_path))
+    root = zarr.group(store=store, overwrite=False)
+    traj_group = root["lafan1"]["sequence_a"]["trajectory_0"]
+    qpos = np.asarray(traj_group["qpos"][:])
+    next_qpos = np.asarray(traj_group["next_qpos"][:])
+
+    np.testing.assert_allclose(first["qpos"].cpu().numpy(), qpos[0], atol=1e-6)
+    np.testing.assert_allclose(first["next_qpos"].cpu().numpy(), next_qpos[0], atol=1e-6)
+    np.testing.assert_allclose(first["next_qpos"].cpu().numpy(), qpos[1], atol=1e-6)
 
 
 def test_lafan1_commands_npz_input(tmp_path: Path) -> None:
