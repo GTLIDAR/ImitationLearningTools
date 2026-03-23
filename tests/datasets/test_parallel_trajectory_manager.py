@@ -97,7 +97,9 @@ def _make_transition_step_rb_and_traj_info(tmp_path, lengths=(5, 6), num_joints=
         for joint_idx in range(num_joints):
             qpos[:, 7 + joint_idx] = steps + float(joint_idx) * 0.1 + i * 100.0
             qvel[:, 6 + joint_idx] = 10.0 + steps + float(joint_idx) + i * 100.0
-            next_qpos[:, 7 + joint_idx] = steps + 1.0 + float(joint_idx) * 0.1 + i * 100.0
+            next_qpos[:, 7 + joint_idx] = (
+                steps + 1.0 + float(joint_idx) * 0.1 + i * 100.0
+            )
             next_qvel[:, 6 + joint_idx] = 20.0 + steps + float(joint_idx) + i * 100.0
         td = TensorDict(
             {
@@ -161,6 +163,9 @@ def test_parallel_trajectory_manager_round_robin(tmp_path):
         target_joint_names=["joint1", "joint2"],
         reference_joint_names=["joint1", "joint2"],
     )
+    # Initial round-robin reset should distribute envs across trajectories.
+    assert mgr.env_traj_rank.tolist() == [0, 1]
+
     # Force both to rank 0 then round-robin reset should move them to rank 1
     mgr.set_env_cursor(env_ids=[0, 1], ranks=torch.tensor([0, 0]))
     mgr.reset_envs([0, 1])
@@ -264,10 +269,12 @@ def test_parallel_trajectory_manager_materializes_aligned_next_fields(tmp_path):
     )
 
 
-def test_parallel_trajectory_manager_root_pose_is_relative_to_first_step(tmp_path):
+def test_parallel_trajectory_manager_root_pose_matches_reference_qpos(tmp_path):
     from iltools.datasets.manager import ParallelTrajectoryManager, ResetSchedule
 
-    storage = LazyMemmapStorage(3, scratch_dir=str(tmp_path), device="cpu", existsok=True)
+    storage = LazyMemmapStorage(
+        3, scratch_dir=str(tmp_path), device="cpu", existsok=True
+    )
     rb = TensorDictReplayBuffer(storage=storage)
 
     qpos = torch.tensor(
@@ -280,11 +287,20 @@ def test_parallel_trajectory_manager_root_pose_is_relative_to_first_step(tmp_pat
     )
     qvel = torch.zeros((3, 8), dtype=torch.float32)
     td = TensorDict(
-        {"obs": torch.zeros((3, 1)), "done": torch.zeros((3, 1), dtype=torch.bool), "qpos": qpos, "qvel": qvel},
+        {
+            "obs": torch.zeros((3, 1)),
+            "done": torch.zeros((3, 1), dtype=torch.bool),
+            "qpos": qpos,
+            "qvel": qvel,
+        },
         batch_size=[3],
     )
     rb.extend(td)
-    traj_info = {"start_index": [0], "end_index": [3], "ordered_traj_list": [("ds", "m", "t0")]}
+    traj_info = {
+        "start_index": [0],
+        "end_index": [3],
+        "ordered_traj_list": [("ds", "m", "t0")],
+    }
 
     mgr = ParallelTrajectoryManager(
         rb=rb,
@@ -297,22 +313,27 @@ def test_parallel_trajectory_manager_root_pose_is_relative_to_first_step(tmp_pat
 
     mgr.set_env_cursor(env_ids=[0], ranks=torch.tensor([0]), steps=torch.tensor([0]))
     td0 = mgr.sample(env_ids=[0], advance=False)
-    assert torch.allclose(td0["raw_root_pos"][0], torch.tensor([1.0, 2.0, 0.0]))
-    assert torch.allclose(td0["root_pos"][0], torch.zeros(3), atol=1.0e-6)
-    assert torch.allclose(td0["root_quat"][0], torch.tensor([1.0, 0.0, 0.0, 0.0]), atol=1.0e-5)
+    assert torch.allclose(td0["root_pos"][0], torch.tensor([1.0, 2.0, 0.0]))
+    assert torch.allclose(
+        td0["root_quat"][0],
+        torch.tensor([0.70710677, 0.0, 0.0, 0.70710677]),
+        atol=1.0e-5,
+    )
 
     mgr.set_env_cursor(env_ids=[0], ranks=torch.tensor([0]), steps=torch.tensor([1]))
     td1 = mgr.sample(env_ids=[0], advance=False)
-    assert torch.allclose(td1["raw_root_pos"][0], torch.tensor([2.0, 2.0, 0.0]))
-    assert torch.allclose(td1["root_pos"][0], torch.tensor([0.0, -1.0, 0.0]), atol=1.0e-5)
-    assert torch.allclose(td1["root_quat"][0], torch.tensor([1.0, 0.0, 0.0, 0.0]), atol=1.0e-5)
+    assert torch.allclose(td1["root_pos"][0], torch.tensor([2.0, 2.0, 0.0]))
+    assert torch.allclose(
+        td1["root_quat"][0],
+        torch.tensor([0.70710677, 0.0, 0.0, 0.70710677]),
+        atol=1.0e-5,
+    )
 
     mgr.set_env_cursor(env_ids=[0], ranks=torch.tensor([0]), steps=torch.tensor([2]))
     td2 = mgr.sample(env_ids=[0], advance=False)
-    assert torch.allclose(td2["raw_root_pos"][0], torch.tensor([1.0, 3.0, 0.0]))
-    assert torch.allclose(td2["root_pos"][0], torch.tensor([1.0, 0.0, 0.0]), atol=1.0e-5)
+    assert torch.allclose(td2["root_pos"][0], torch.tensor([1.0, 3.0, 0.0]))
     assert torch.allclose(
-        td2["root_quat"][0], torch.tensor([0.70710677, 0.0, 0.0, 0.70710677]), atol=1.0e-5
+        td2["root_quat"][0], torch.tensor([0.0, 0.0, 0.0, 1.0]), atol=1.0e-5
     )
 
 

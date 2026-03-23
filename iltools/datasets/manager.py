@@ -191,7 +191,9 @@ class ParallelTrajectoryManager:
             traj: idx for idx, traj in enumerate(self._ordered_traj_list)
         }
         sample_keys = {str(key) for key in self.rb[0].keys()}
-        self.has_next_reference = "next_qpos" in sample_keys and "next_qvel" in sample_keys
+        self.has_next_reference = (
+            "next_qpos" in sample_keys and "next_qvel" in sample_keys
+        )
 
         self.env_traj_rank = torch.zeros(
             (self.num_envs,), dtype=torch.int64, device=self._state_device
@@ -207,6 +209,12 @@ class ParallelTrajectoryManager:
         self._next_rank = 0
         self._reconstructed_action_targets: Tensor | None = None
 
+        if self.reset_schedule == ResetSchedule.ROUND_ROBIN:
+            # Prime per-env cursors so the first reset fans out across trajectories
+            # while keeping later resets as "advance this env to its next rank".
+            self.env_traj_rank.copy_(
+                torch.remainder(self._all_env_ids - 1, self.num_trajectories)
+            )
         self.reset_envs(self._all_env_ids)
         logger.info(
             "Initialized ParallelTrajectoryManager(num_envs=%s, num_trajectories=%s, reset_schedule=%s, reset_start_step=%s)",
@@ -462,7 +470,9 @@ class ParallelTrajectoryManager:
         td.set(make_key("joint_pos"), joint_pos_out)
         td.set(make_key("joint_vel"), joint_vel_out)
 
-    def _attach_reference_fields(self, td: TensorDict, *, use_buffers: bool) -> TensorDict:
+    def _attach_reference_fields(
+        self, td: TensorDict, *, use_buffers: bool
+    ) -> TensorDict:
         if td.get("qpos") is None or td.get("qvel") is None:
             raise AssertionError("qpos and qvel must be present in the reference data")
 
@@ -496,9 +506,9 @@ class ParallelTrajectoryManager:
             dtype=torch.int64,
             device=self._reconstructed_action_targets.device,
         )
-        return self._reconstructed_action_targets.index_select(0, index.reshape(-1)).reshape(
-            index.shape + (self._reconstructed_action_targets.shape[-1],)
-        )
+        return self._reconstructed_action_targets.index_select(
+            0, index.reshape(-1)
+        ).reshape(index.shape + (self._reconstructed_action_targets.shape[-1],))
 
     def sample_random_transitions(
         self,
@@ -521,7 +531,9 @@ class ParallelTrajectoryManager:
             torch.rand(batch_size, device=self._state_device)
             * lengths.to(dtype=torch.float32)
         ).to(dtype=torch.int64)
-        global_indices = get_global_index(traj_ranks, self._start, self._end, random_steps)
+        global_indices = get_global_index(
+            traj_ranks, self._start, self._end, random_steps
+        )
 
         reference = self.rb[global_indices.to(device=self._storage_device)]
         if self._device is not None:
@@ -537,7 +549,9 @@ class ParallelTrajectoryManager:
         use_buffers: bool = False,
     ) -> TensorDict:
         """Sample one transition per env (or subset) via direct storage indexing."""
-        env_ids_t = self._all_env_ids if env_ids is None else self._normalize_env_ids(env_ids)
+        env_ids_t = (
+            self._all_env_ids if env_ids is None else self._normalize_env_ids(env_ids)
+        )
 
         r = self.env_traj_rank[env_ids_t]
         step = self.env_step[env_ids_t]
@@ -576,7 +590,9 @@ class ParallelTrajectoryManager:
         if mode not in {"contiguous", "independent"}:
             raise ValueError("mode must be 'contiguous' or 'independent'")
 
-        env_ids_t = self._all_env_ids if env_ids is None else self._normalize_env_ids(env_ids)
+        env_ids_t = (
+            self._all_env_ids if env_ids is None else self._normalize_env_ids(env_ids)
+        )
 
         r = self.env_traj_rank[env_ids_t]
         length = self._length[r].clamp(min=1)
