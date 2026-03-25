@@ -417,7 +417,7 @@ class LocoMuJoCoLoader(BaseLoader):
             sliced = np.asarray(value[traj_start:traj_end])
             chunks = [chunk_size] + list(sliced.shape[1:])
             shards = [shard_size] + list(sliced.shape[1:])
-            dataset = traj_group.create_dataset(
+            dataset = traj_group.create_array(
                 key,
                 shape=sliced.shape,
                 dtype=sliced.dtype,
@@ -513,5 +513,5 @@ class LocoMuJoCoLoader(BaseLoader):
         self, group: zarr.Group, name: str, data: np.ndarray
     ) -> None:
         """Create and populate a transition dataset in Zarr."""
-        ds = group.create_dataset(name, shape=data.shape, dtype=data.dtype)
+        ds = group.create_array(name, shape=data.shape, dtype=data.dtype)
         ds[:] = data

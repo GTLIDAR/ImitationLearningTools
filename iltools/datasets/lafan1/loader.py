@@ -1147,7 +1147,7 @@ class Lafan1CsvLoader(BaseLoader):
 
             chunks = [min(chunk_size, array.shape[0])] + list(array.shape[1:])
             shards = [min(shard_size, array.shape[0])] + list(array.shape[1:])
-            ds = traj_group.create_dataset(
+            ds = traj_group.create_array(
                 key,
                 shape=array.shape,
                 dtype=array.dtype,
