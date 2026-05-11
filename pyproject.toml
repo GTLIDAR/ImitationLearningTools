@@ -29,6 +29,7 @@ dependencies = [
 
 [project.optional-dependencies]
 loco-mujoco = ["loco-mujoco"]
+lerobot = ["lerobot"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
