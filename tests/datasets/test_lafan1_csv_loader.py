@@ -13,7 +13,9 @@ from iltools.datasets.utils import make_rb_from
 def _write_motion_csv(path: Path, *, frames: int = 12, joints: int = 4) -> None:
     t = np.arange(frames, dtype=np.float32)
     root_pos = np.stack([0.1 * t, 0.05 * t, np.ones_like(t)], axis=1)
-    root_quat_xyzw = np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (frames, 1))
+    root_quat_xyzw = np.tile(
+        np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (frames, 1)
+    )
     joint_pos = np.stack(
         [np.sin(0.15 * t + float(j)) for j in range(joints)],
         axis=1,
@@ -22,7 +24,14 @@ def _write_motion_csv(path: Path, *, frames: int = 12, joints: int = 4) -> None:
     np.savetxt(path, motion, delimiter=",")
 
 
-def _write_commands_style_npz(path: Path, *, frames: int = 10, joints: int = 6, fps: float = 50.0) -> None:
+def _write_commands_style_npz(
+    path: Path,
+    *,
+    frames: int = 10,
+    joints: int = 6,
+    fps: float = 50.0,
+    joint_names: list[str] | None = None,
+) -> None:
     t = np.arange(frames, dtype=np.float32)
     joint_pos = np.stack(
         [0.2 * np.sin(0.1 * t + i) for i in range(joints)],
@@ -38,16 +47,18 @@ def _write_commands_style_npz(path: Path, *, frames: int = 10, joints: int = 6, 
     body_lin_vel_w = np.gradient(body_pos_w, 1.0 / fps, axis=0).astype(np.float32)
     body_ang_vel_w = np.zeros((frames, 1, 3), dtype=np.float32)
 
-    np.savez(
-        path,
-        fps=np.array([fps], dtype=np.float32),
-        joint_pos=joint_pos,
-        joint_vel=joint_vel,
-        body_pos_w=body_pos_w,
-        body_quat_w=body_quat_w,
-        body_lin_vel_w=body_lin_vel_w,
-        body_ang_vel_w=body_ang_vel_w,
-    )
+    payload = {
+        "fps": np.array([fps], dtype=np.float32),
+        "joint_pos": joint_pos,
+        "joint_vel": joint_vel,
+        "body_pos_w": body_pos_w,
+        "body_quat_w": body_quat_w,
+        "body_lin_vel_w": body_lin_vel_w,
+        "body_ang_vel_w": body_ang_vel_w,
+    }
+    if joint_names is not None:
+        payload["joint_names"] = np.asarray(joint_names, dtype=np.str_)
+    np.savez(path, **payload)
 
 
 def test_lafan1_csv_loader_builds_manifest_and_metadata(tmp_path: Path) -> None:
@@ -120,7 +131,9 @@ def test_lafan1_csv_loader_writes_zarr(tmp_path: Path) -> None:
     assert len(loader.trajectory_info_list) == 2
 
 
-def test_lafan1_csv_loader_make_rb_preserves_transition_alignment(tmp_path: Path) -> None:
+def test_lafan1_csv_loader_make_rb_preserves_transition_alignment(
+    tmp_path: Path,
+) -> None:
     csv_a = tmp_path / "sequence_a.csv"
     csv_b = tmp_path / "sequence_b.csv"
     _write_motion_csv(csv_a, frames=12, joints=3)
@@ -145,7 +158,9 @@ def test_lafan1_csv_loader_make_rb_preserves_transition_alignment(tmp_path: Path
     next_qpos = np.asarray(traj_group["next_qpos"][:])
 
     np.testing.assert_allclose(first["qpos"].cpu().numpy(), qpos[0], atol=1e-6)
-    np.testing.assert_allclose(first["next_qpos"].cpu().numpy(), next_qpos[0], atol=1e-6)
+    np.testing.assert_allclose(
+        first["next_qpos"].cpu().numpy(), next_qpos[0], atol=1e-6
+    )
     np.testing.assert_allclose(first["next_qpos"].cpu().numpy(), qpos[1], atol=1e-6)
 
 
@@ -178,6 +193,26 @@ def test_lafan1_commands_npz_input(tmp_path: Path) -> None:
     assert "body_pos_w" in loader.metadata.keys
 
 
+def test_lafan1_npz_joint_names_metadata(tmp_path: Path) -> None:
+    npz_file = tmp_path / "named_commands_style.npz"
+    joint_names = [f"named_joint_{index}" for index in range(4)]
+    _write_commands_style_npz(
+        npz_file,
+        frames=7,
+        joints=4,
+        fps=30.0,
+        joint_names=joint_names,
+    )
+
+    cfg = {
+        "dataset": {"trajectories": {"lafan1_csv": [str(npz_file)]}},
+        "control_freq": 30,
+    }
+    loader = Lafan1CsvLoader(cfg=cfg, build_zarr_dataset=False)
+
+    assert loader.metadata.joint_names == joint_names
+
+
 def test_lafan1_csv_loader_honors_frame_range(tmp_path: Path) -> None:
     csv_file = tmp_path / "slice_test.csv"
     _write_motion_csv(csv_file, frames=14, joints=2)
@@ -193,7 +228,9 @@ def test_lafan1_csv_loader_honors_frame_range(tmp_path: Path) -> None:
     assert loader.metadata.trajectory_lengths == [8]
 
 
-def test_lafan1_csv_loader_groups_multiple_files_under_one_motion(tmp_path: Path) -> None:
+def test_lafan1_csv_loader_groups_multiple_files_under_one_motion(
+    tmp_path: Path,
+) -> None:
     dance_a = tmp_path / "dance_a.csv"
     dance_b = tmp_path / "dance_b.csv"
     walk_a = tmp_path / "walk_a.csv"
@@ -206,7 +243,11 @@ def test_lafan1_csv_loader_groups_multiple_files_under_one_motion(tmp_path: Path
         "dataset": {
             "trajectories": {
                 "lafan1_csv": [
-                    {"name": "dance_combo", "paths": [str(dance_a), str(dance_b)], "input_fps": 60},
+                    {
+                        "name": "dance_combo",
+                        "paths": [str(dance_a), str(dance_b)],
+                        "input_fps": 60,
+                    },
                     {"name": "walk_combo", "path": str(walk_a), "input_fps": 60},
                 ]
             }

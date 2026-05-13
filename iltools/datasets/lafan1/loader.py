@@ -98,7 +98,9 @@ def _normalize_frame_range(value: Any) -> tuple[int, int] | None:
     else:
         seq = list(value)
         if len(seq) != 2:
-            raise ValueError("frame_range must have exactly two elements: [start, end].")
+            raise ValueError(
+                "frame_range must have exactly two elements: [start, end]."
+            )
         start, end = seq
     start_i = int(start)
     end_i = int(end)
@@ -315,7 +317,10 @@ class Lafan1CsvLoader(BaseLoader):
             if self._looks_like_motion_entry(value):
                 return [value]
             # Mapping style: motion_name -> path(s)
-            return [{"name": str(name), "path": path_spec} for name, path_spec in value.items()]
+            return [
+                {"name": str(name), "path": path_spec}
+                for name, path_spec in value.items()
+            ]
         return _as_list(value)
 
     def _looks_like_motion_entry(self, value: Mapping[str, Any]) -> bool:
@@ -370,7 +375,9 @@ class Lafan1CsvLoader(BaseLoader):
                     "files",
                     entry.get(
                         "csv_files",
-                        entry.get("path", entry.get("file", entry.get("csv_path", None))),
+                        entry.get(
+                            "path", entry.get("file", entry.get("csv_path", None))
+                        ),
                     ),
                 ),
             )
@@ -514,7 +521,9 @@ class Lafan1CsvLoader(BaseLoader):
             if build_zarr_dataset and dataset_group is not None:
                 motion_group = dataset_group.create_group(motion_name)
 
-            motion_entry = motion_info_dict.setdefault(self.dataset_name, {}).setdefault(
+            motion_entry = motion_info_dict.setdefault(
+                self.dataset_name, {}
+            ).setdefault(
                 motion_name,
                 {
                     "motion_name": motion_name,
@@ -579,7 +588,9 @@ class Lafan1CsvLoader(BaseLoader):
 
             if motion_group is not None:
                 motion_group.attrs["num_trajectories"] = len(motion_sources)
-                motion_group.attrs["trajectory_lengths"] = motion_entry["trajectory_lengths"]
+                motion_group.attrs["trajectory_lengths"] = motion_entry[
+                    "trajectory_lengths"
+                ]
                 motion_group.attrs["source_files"] = motion_entry["source_files"]
                 motion_group.attrs["source_fps"] = motion_entry["source_fps"]
                 motion_group.attrs["output_fps"] = motion_entry["output_fps"]
@@ -721,7 +732,11 @@ class Lafan1CsvLoader(BaseLoader):
         with np.load(source.path) as npz_data:
             arrays = {key: np.asarray(npz_data[key]) for key in npz_data.files}
 
-        source_fps = float(np.asarray(arrays.get("fps", source.input_fps)).reshape(-1)[0])
+        self._apply_npz_name_metadata(arrays=arrays, path=source.path)
+
+        source_fps = float(
+            np.asarray(arrays.get("fps", source.input_fps)).reshape(-1)[0]
+        )
         if source_fps <= 0.0:
             raise ValueError(f"Invalid source fps ({source_fps}) for {source.path}")
 
@@ -755,11 +770,17 @@ class Lafan1CsvLoader(BaseLoader):
                     f"NPZ {source.path} must contain 'qpos' or 'joint_pos'."
                 )
             joint_pos = joint_pos.astype(np.float32)
-            joint_pos = self._apply_frame_range(joint_pos, source.frame_range, source.path)
+            joint_pos = self._apply_frame_range(
+                joint_pos, source.frame_range, source.path
+            )
 
             root_pos, root_quat = self._extract_root_pose_from_npz(arrays, source.path)
-            root_pos = self._apply_frame_range(root_pos, source.frame_range, source.path)
-            root_quat = self._apply_frame_range(root_quat, source.frame_range, source.path)
+            root_pos = self._apply_frame_range(
+                root_pos, source.frame_range, source.path
+            )
+            root_quat = self._apply_frame_range(
+                root_quat, source.frame_range, source.path
+            )
 
             joint_vel_raw = arrays.get("joint_vel")
             root_lin_vel_raw, root_ang_vel_raw = self._extract_root_vel_from_npz(arrays)
@@ -769,12 +790,16 @@ class Lafan1CsvLoader(BaseLoader):
                 else None
             )
             root_lin_vel = (
-                self._apply_frame_range(root_lin_vel_raw, source.frame_range, source.path)
+                self._apply_frame_range(
+                    root_lin_vel_raw, source.frame_range, source.path
+                )
                 if root_lin_vel_raw is not None
                 else None
             )
             root_ang_vel = (
-                self._apply_frame_range(root_ang_vel_raw, source.frame_range, source.path)
+                self._apply_frame_range(
+                    root_ang_vel_raw, source.frame_range, source.path
+                )
                 if root_ang_vel_raw is not None
                 else None
             )
@@ -824,6 +849,55 @@ class Lafan1CsvLoader(BaseLoader):
             extra_data=extra_data,
         )
         return traj_data, source_fps, output_fps
+
+    def _apply_npz_name_metadata(
+        self, *, arrays: Mapping[str, np.ndarray], path: Path
+    ) -> None:
+        self._apply_npz_names(
+            key="joint_names",
+            current=self._joint_names,
+            setter=lambda names: setattr(self, "_joint_names", names),
+            arrays=arrays,
+            path=path,
+        )
+        self._apply_npz_names(
+            key="body_names",
+            current=self._body_names,
+            setter=lambda names: setattr(self, "_body_names", names),
+            arrays=arrays,
+            path=path,
+        )
+        self._apply_npz_names(
+            key="site_names",
+            current=self._site_names,
+            setter=lambda names: setattr(self, "_site_names", names),
+            arrays=arrays,
+            path=path,
+        )
+
+    def _apply_npz_names(
+        self,
+        *,
+        key: str,
+        current: list[str] | None,
+        setter: Any,
+        arrays: Mapping[str, np.ndarray],
+        path: Path,
+    ) -> None:
+        if key not in arrays:
+            return
+        value = np.asarray(arrays[key])
+        if value.ndim != 1:
+            raise ValueError(f"NPZ {path} {key} must be a 1D array.")
+        parsed = [str(item) for item in value.tolist()]
+        if current is None:
+            setter(parsed)
+            return
+        if parsed != current:
+            raise ValueError(
+                f"NPZ {path} {key} does not match configured {key}: "
+                f"expected={current}, got={parsed}."
+            )
 
     def _extract_root_pose_from_npz(
         self, arrays: Mapping[str, np.ndarray], path: Path
@@ -890,9 +964,9 @@ class Lafan1CsvLoader(BaseLoader):
         qpos = np.concatenate([root_pos, root_quat, joint_pos], axis=-1).astype(
             np.float32
         )
-        qvel = np.concatenate(
-            [root_lin_vel, root_ang_vel, joint_vel], axis=-1
-        ).astype(np.float32)
+        qvel = np.concatenate([root_lin_vel, root_ang_vel, joint_vel], axis=-1).astype(
+            np.float32
+        )
 
         traj_data: dict[str, np.ndarray] = {
             "qpos": qpos,
@@ -1124,9 +1198,9 @@ class Lafan1CsvLoader(BaseLoader):
             theta = theta_0 * t[~linear_mask]
             s0 = np.sin(theta_0 - theta) / np.maximum(sin_theta_0, EPS)
             s1 = np.sin(theta) / np.maximum(sin_theta_0, EPS)
-            out[~linear_mask] = qa[~linear_mask] * s0[:, None] + qb[~linear_mask] * s1[
-                :, None
-            ]
+            out[~linear_mask] = (
+                qa[~linear_mask] * s0[:, None] + qb[~linear_mask] * s1[:, None]
+            )
             out[~linear_mask] = self._normalize_quat(out[~linear_mask])
         return out.astype(np.float32)
 

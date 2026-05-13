@@ -24,7 +24,41 @@ from torchrl.data.replay_buffers.writers import TensorDictRoundRobinWriter
 logger = logging.getLogger(__name__)
 
 
+# The public Unitree WBT datasets store robot_q_current[7:] and robot_q_desired[7:]
+# in Unitree G1_29_JointIndex order. This matches Unitree's unitree_lerobot enum
+# and the G1 29-DoF MuJoCo actuator order.
 UNITREE_G1_WBT_DEFAULT_REPO_ID = "unitreerobotics/G1_WBT_Brainco_Pickup_Pillow"
+UNITREE_G1_WBT_29DOF_DATASET_JOINT_NAMES: tuple[str, ...] = (
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +71,10 @@ class UnitreeG1WBT29DofMapperConfig:
     dt: float = 1.0 / 30.0
     default_joint_pos: Sequence[Any] = ()
     action_scale: Sequence[float] = ()
+    dataset_joint_names: Sequence[str] = UNITREE_G1_WBT_29DOF_DATASET_JOINT_NAMES
+    target_joint_names: Sequence[str] = ()
+    align_root_z_to_default: bool = False
+    default_root_height: float = 0.0
     quat_order: str = "wxyz"
 
 
@@ -45,7 +83,14 @@ class LeRobotStreamingCacheConfig:
     """Runtime options for streaming LeRobot data into a TorchRL cache."""
 
     repo_id: str = UNITREE_G1_WBT_DEFAULT_REPO_ID
+    """Primary LeRobot repo id. Used when ``repo_ids`` is empty."""
+
+    repo_ids: Sequence[str] = ()
+    """Optional ordered list of LeRobot repo ids to stream sequentially."""
+
     split: str = "train"
+    """Dataset split shared by all configured repos."""
+
     cache_dir: str | Path = "/tmp/iltools_lerobot_torchrl_cache"
     max_cache_transitions: int = 5_000_000
     min_ready_transitions: int = 100_000
@@ -54,6 +99,7 @@ class LeRobotStreamingCacheConfig:
     local_sample_prefetch: int = 0
     batch_size: int | None = None
     max_episodes: int | None = None
+    max_episodes_per_repo: int | None = None
     mapper: UnitreeG1WBT29DofMapperConfig = UnitreeG1WBT29DofMapperConfig()
 
 
@@ -132,6 +178,12 @@ def _get_required(mapping: Mapping[Any, Any] | TensorDictBase, key: str) -> Any:
     return value
 
 
+def _get_optional(mapping: Mapping[Any, Any] | TensorDictBase, key: str) -> Any:
+    if isinstance(mapping, TensorDictBase):
+        return mapping.get(key)
+    return mapping.get(key)
+
+
 def _stack_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> TensorDict:
     if len(rows) == 0:
         raise ValueError("Cannot stack an empty episode.")
@@ -158,6 +210,23 @@ class UnitreeG1WBT29DofMapper:
         self.config = config
         if float(config.dt) <= 0.0:
             raise ValueError("mapper.dt must be positive.")
+        self.dataset_joint_names = tuple(config.dataset_joint_names)
+        if len(self.dataset_joint_names) == 0:
+            self.dataset_joint_names = UNITREE_G1_WBT_29DOF_DATASET_JOINT_NAMES
+        self.target_joint_names = tuple(config.target_joint_names)
+        if len(self.target_joint_names) == 0:
+            self.target_joint_names = self.dataset_joint_names
+        self._validate_joint_names(
+            self.dataset_joint_names, label="dataset_joint_names"
+        )
+        self._validate_joint_names(self.target_joint_names, label="target_joint_names")
+        self._dataset_to_target_index = torch.tensor(
+            [
+                self.dataset_joint_names.index(joint_name)
+                for joint_name in self.target_joint_names
+            ],
+            dtype=torch.int64,
+        )
         default_joint_pos = _to_tensor(config.default_joint_pos)
         if default_joint_pos.ndim == 1:
             self.default_joint_pos_pool = default_joint_pos.unsqueeze(0)
@@ -184,6 +253,33 @@ class UnitreeG1WBT29DofMapper:
             )
         if torch.any(self.action_scale.abs() <= 1.0e-8):
             raise ValueError("action_scale must not contain zeros.")
+
+    def _validate_joint_names(self, joint_names: Sequence[str], *, label: str) -> None:
+        if len(joint_names) != self.joint_width:
+            raise ValueError(f"{label} must contain 29 joint names.")
+        if len(set(joint_names)) != len(joint_names):
+            raise ValueError(f"{label} must not contain duplicate joint names.")
+        if label == "target_joint_names":
+            missing = [
+                joint_name
+                for joint_name in joint_names
+                if joint_name not in self.dataset_joint_names
+            ]
+            extra = [
+                joint_name
+                for joint_name in self.dataset_joint_names
+                if joint_name not in joint_names
+            ]
+            if missing or extra:
+                raise ValueError(
+                    "target_joint_names must contain the same joints as "
+                    "dataset_joint_names; "
+                    f"missing={missing}, extra={extra}."
+                )
+
+    def _dataset_joints_to_target_order(self, joints: Tensor) -> Tensor:
+        index = self._dataset_to_target_index.to(device=joints.device)
+        return joints.index_select(-1, index)
 
     def map_episode(
         self, episode: TensorDictBase | Mapping[str, Any] | Sequence[Mapping[str, Any]]
@@ -222,7 +318,9 @@ class UnitreeG1WBT29DofMapper:
             )
         return self._map_batched_episode(episode_td)
 
-    def _episode_default_joint_pos(self, episode: TensorDictBase, like: Tensor) -> Tensor:
+    def _episode_default_joint_pos(
+        self, episode: TensorDictBase, like: Tensor
+    ) -> Tensor:
         pool = self.default_joint_pos_pool.to(device=like.device, dtype=like.dtype)
         if pool.shape[0] == 1:
             return pool[0]
@@ -263,7 +361,14 @@ class UnitreeG1WBT29DofMapper:
             robot_q_current[:, 3:7], self.config.quat_order
         )
         root_pos = robot_q_current[:, :3]
-        joint_pos = robot_q_current[:, 7:]
+        if self.config.align_root_z_to_default:
+            root_pos = root_pos.clone()
+            default_root_height = root_pos.new_tensor(
+                float(self.config.default_root_height)
+            )
+            root_pos[:, 2] += default_root_height - root_pos[0, 2]
+        joint_pos = self._dataset_joints_to_target_order(robot_q_current[:, 7:])
+        joint_pos_desired = self._dataset_joints_to_target_order(robot_q_desired[:, 7:])
         joint_vel = _finite_difference(joint_pos, self.config.dt)
         base_ang_vel = _so3_derivative_wxyz(root_quat, self.config.dt)
         expert_motion = torch.cat([joint_pos, joint_vel], dim=-1)
@@ -277,7 +382,7 @@ class UnitreeG1WBT29DofMapper:
             device=robot_q_current.device,
             dtype=robot_q_current.dtype,
         )
-        expert_action = (robot_q_desired[:, 7:] - default_joint_pos) / action_scale
+        expert_action = (joint_pos_desired - default_joint_pos) / action_scale
         last_action = torch.cat(
             [torch.zeros_like(expert_action[:1]), expert_action[:-1]], dim=0
         )
@@ -370,6 +475,15 @@ class StreamingTensorDictReplayCache:
         self._stop_event = threading.Event()
         self._error: BaseException | None = None
         self._episodes_written = 0
+        self._repos_completed = 0
+        self.repo_ids = self._normalize_repo_ids(config)
+
+    @staticmethod
+    def _normalize_repo_ids(config: LeRobotStreamingCacheConfig) -> tuple[str, ...]:
+        repo_ids = tuple(str(repo_id) for repo_id in config.repo_ids if str(repo_id))
+        if repo_ids:
+            return repo_ids
+        return (str(config.repo_id),)
 
     @property
     def ready_transitions(self) -> int:
@@ -398,9 +512,11 @@ class StreamingTensorDictReplayCache:
         )
         with self._condition:
             ready = self._condition.wait_for(
-                lambda: self.ready_transitions >= min_ready
-                or self._error is not None
-                or (self._thread is not None and not self._thread.is_alive()),
+                lambda: (
+                    self.ready_transitions >= min_ready
+                    or self._error is not None
+                    or (self._thread is not None and not self._thread.is_alive())
+                ),
                 timeout=float(timeout_s),
             )
             if self._error is not None:
@@ -433,9 +549,12 @@ class StreamingTensorDictReplayCache:
         if self.source is not None:
             yield from self.source
             return
+
+        use_lerobot = True
         try:
             from lerobot.datasets import StreamingLeRobotDataset
         except ImportError:
+            use_lerobot = False
             try:
                 from datasets import load_dataset
             except ImportError as exc:
@@ -444,28 +563,56 @@ class StreamingTensorDictReplayCache:
                     "Install iltools[lerobot], install lerobot directly, or install "
                     "huggingface datasets."
                 ) from exc
-            yield from load_dataset(
-                self.config.repo_id,
-                split=self.config.split,
-                streaming=True,
-            )
-            return
-        yield from StreamingLeRobotDataset(self.config.repo_id)
+
+        max_episodes_per_repo = self.config.max_episodes_per_repo
+        if max_episodes_per_repo is not None and int(max_episodes_per_repo) <= 0:
+            max_episodes_per_repo = None
+
+        for repo_index, repo_id in enumerate(self.repo_ids):
+            if use_lerobot:
+                iterator = StreamingLeRobotDataset(repo_id)
+            else:
+                iterator = load_dataset(  # type: ignore[name-defined]
+                    repo_id,
+                    split=self.config.split,
+                    streaming=True,
+                )
+            current_episode_id: int | None = None
+            episodes_seen = 0
+            for row in iterator:
+                episode_id = int(_get_required(row, self.config.mapper.episode_key))
+                if current_episode_id is None:
+                    current_episode_id = episode_id
+                elif episode_id != current_episode_id:
+                    episodes_seen += 1
+                    if max_episodes_per_repo is not None and episodes_seen >= int(
+                        max_episodes_per_repo
+                    ):
+                        break
+                    current_episode_id = episode_id
+                enriched_row = dict(row)
+                enriched_row["__lerobot_repo_id"] = repo_id
+                enriched_row["__lerobot_repo_index"] = repo_index
+                yield enriched_row
+            self._repos_completed += 1
 
     def _producer_loop(self) -> None:
         try:
-            current_episode_id: int | None = None
+            current_episode_key: tuple[int, int] | None = None
             current_rows: list[Mapping[str, Any]] = []
             for row in self._source_iter():
                 if self._stop_event.is_set():
                     break
                 episode_id = int(_get_required(row, self.config.mapper.episode_key))
-                if current_episode_id is None:
-                    current_episode_id = episode_id
-                if episode_id != current_episode_id:
+                repo_index_like = _get_optional(row, "__lerobot_repo_index")
+                repo_index = int(repo_index_like) if repo_index_like is not None else 0
+                episode_key = (repo_index, episode_id)
+                if current_episode_key is None:
+                    current_episode_key = episode_key
+                if episode_key != current_episode_key:
                     self._write_episode(current_rows)
                     current_rows = []
-                    current_episode_id = episode_id
+                    current_episode_key = episode_key
                     if (
                         self.config.max_episodes is not None
                         and self._episodes_written >= int(self.config.max_episodes)

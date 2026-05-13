@@ -7,6 +7,7 @@ from tensordict import TensorDict
 from iltools.datasets.lerobot_stream import (
     LeRobotStreamingCacheConfig,
     StreamingTensorDictReplayCache,
+    UNITREE_G1_WBT_29DOF_DATASET_JOINT_NAMES,
     UnitreeG1WBT29DofMapper,
     UnitreeG1WBT29DofMapperConfig,
 )
@@ -152,6 +153,96 @@ def test_unitree_g1_wbt_mapper_selects_episode_default_from_pool() -> None:
     )
 
 
+def test_unitree_g1_wbt_mapper_reorders_dataset_joints_to_target_order() -> None:
+    dataset_joint_names = UNITREE_G1_WBT_29DOF_DATASET_JOINT_NAMES
+    target_joint_names = tuple(reversed(dataset_joint_names))
+    default_joint_pos = torch.linspace(-0.2, 0.2, 29)
+    action_scale = torch.linspace(0.5, 1.5, 29)
+    mapper = UnitreeG1WBT29DofMapper(
+        UnitreeG1WBT29DofMapperConfig(
+            default_joint_pos=default_joint_pos.tolist(),
+            action_scale=action_scale.tolist(),
+            target_joint_names=target_joint_names,
+        )
+    )
+
+    length = 4
+    q_current = torch.zeros(length, 36)
+    q_current[:, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    dataset_joint_pos = torch.stack(
+        [
+            torch.arange(29, dtype=torch.float32) + 100.0 * frame
+            for frame in range(length)
+        ]
+    )
+    q_current[:, 7:] = dataset_joint_pos
+    expected_target_joint_pos = torch.flip(dataset_joint_pos, dims=[1])
+
+    expert_action = torch.stack(
+        [torch.linspace(-0.5, 0.5, 29) + 0.05 * float(frame) for frame in range(length)]
+    )
+    q_desired = q_current.clone()
+    desired_target_order = default_joint_pos + expert_action * action_scale
+    q_desired[:, 7:] = torch.flip(desired_target_order, dims=[1])
+    rows = [
+        {
+            "episode_index": 0,
+            "observation.state.robot_q_current": q_current[index],
+            "action.robot_q_desired": q_desired[index],
+        }
+        for index in range(length)
+    ]
+
+    transitions = mapper.map_episode(rows)
+
+    torch.testing.assert_close(
+        transitions.get(("policy", "joint_pos")),
+        expected_target_joint_pos[:-1],
+    )
+    torch.testing.assert_close(transitions["expert_action"], expert_action[:-1])
+    torch.testing.assert_close(
+        transitions.get(("policy", "expert_motion"))[:, :29],
+        expected_target_joint_pos[:-1],
+    )
+
+
+def test_unitree_g1_wbt_mapper_aligns_first_root_z_to_default_height() -> None:
+    default_joint_pos = torch.zeros(29)
+    action_scale = torch.ones(29)
+    mapper = UnitreeG1WBT29DofMapper(
+        UnitreeG1WBT29DofMapperConfig(
+            default_joint_pos=default_joint_pos.tolist(),
+            action_scale=action_scale.tolist(),
+            align_root_z_to_default=True,
+            default_root_height=0.76,
+        )
+    )
+    length = 4
+    q_current = torch.zeros(length, 36)
+    q_current[:, 2] = torch.tensor([0.5, 0.45, 0.4, 0.35])
+    q_current[:, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    q_desired = q_current.clone()
+    rows = [
+        {
+            "episode_index": 0,
+            "observation.state.robot_q_current": q_current[index],
+            "action.robot_q_desired": q_desired[index],
+        }
+        for index in range(length)
+    ]
+
+    transitions = mapper.map_episode(rows)
+
+    torch.testing.assert_close(
+        transitions.get(("policy", "root_pos"))[:, 2],
+        torch.tensor([0.76, 0.71, 0.66]),
+    )
+    torch.testing.assert_close(
+        transitions.get(("next", "policy", "root_pos"))[:, 2],
+        torch.tensor([0.71, 0.66, 0.61]),
+    )
+
+
 def test_unitree_g1_wbt_mapper_fails_fast_on_bad_robot_width() -> None:
     mapper = _make_mapper()
     episode = TensorDict(
@@ -192,3 +283,38 @@ def test_streaming_cache_fills_memmap_before_sampling(tmp_path) -> None:
     assert ("policy", "base_ang_vel") in sample.keys(True)
     assert ("next", "policy", "joint_pos_rel") in sample.keys(True)
     assert "expert_action" in sample.keys(True)
+
+
+def test_streaming_cache_keeps_same_episode_ids_separate_across_repos(tmp_path) -> None:
+    mapper = _make_mapper()
+    rows_a, _, _ = _make_fake_wbt_rows(episode_index=0, length=4)
+    rows_b, _, _ = _make_fake_wbt_rows(episode_index=0, length=4)
+    rows = [
+        {**row, "__lerobot_repo_index": 0, "__lerobot_repo_id": "repo/a"}
+        for row in rows_a
+    ] + [
+        {**row, "__lerobot_repo_index": 1, "__lerobot_repo_id": "repo/b"}
+        for row in rows_b
+    ]
+    cache = StreamingTensorDictReplayCache(
+        LeRobotStreamingCacheConfig(
+            repo_ids=("repo/a", "repo/b"),
+            cache_dir=tmp_path,
+            max_cache_transitions=16,
+            min_ready_transitions=6,
+            low_watermark=4,
+            max_episodes=2,
+            mapper=mapper.config,
+        ),
+        mapper=mapper,
+        source=rows,
+    )
+
+    cache.start()
+    cache.wait_until_ready(timeout_s=5.0)
+    sample = cache.sample(6)
+    cache.stop()
+
+    assert sample.numel() == 6
+    assert cache.ready_transitions == 6
+    assert cache._episodes_written == 2

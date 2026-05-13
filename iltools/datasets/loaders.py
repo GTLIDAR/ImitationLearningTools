@@ -29,6 +29,11 @@ _DATASET_LOADERS: dict[str, DatasetLoaderSpec] = {
         module="iltools.datasets.lafan1.loader",
         class_name="Lafan1CsvLoader",
     ),
+    "lerobot": DatasetLoaderSpec(
+        module="iltools.datasets.lerobot.loader",
+        class_name="LeRobotLoader",
+        optional_dependency="lerobot",
+    ),
     "loco_mujoco": DatasetLoaderSpec(
         module="iltools.datasets.loco_mujoco.loader",
         class_name="LocoMuJoCoLoader",
