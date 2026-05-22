@@ -723,6 +723,7 @@ class Lafan1CsvLoader(BaseLoader):
             root_ang_vel=root_ang_vel,
             joint_vel=joint_vel,
             extra_data=None,
+            action=None,
         )
         return traj_data, source.input_fps, self.control_freq
 
@@ -739,6 +740,8 @@ class Lafan1CsvLoader(BaseLoader):
         )
         if source_fps <= 0.0:
             raise ValueError(f"Invalid source fps ({source_fps}) for {source.path}")
+
+        action = self._extract_npz_action_labels(arrays, source.path)
 
         if "qpos" in arrays:
             qpos = arrays["qpos"].astype(np.float32)
@@ -809,6 +812,9 @@ class Lafan1CsvLoader(BaseLoader):
                 if key in OPTIONAL_BODY_KEYS
             }
 
+        if action is not None:
+            action = self._apply_frame_range(action, source.frame_range, source.path)
+
         root_quat = self._normalize_quat(root_quat.astype(np.float32))
         needs_resample = not np.isclose(source_fps, self.control_freq)
 
@@ -828,6 +834,7 @@ class Lafan1CsvLoader(BaseLoader):
             )
             # Body states are not resampled here to avoid introducing FK assumptions.
             extra_data = None
+            action = None
             output_fps = self.control_freq
         else:
             output_fps = source_fps
@@ -847,8 +854,69 @@ class Lafan1CsvLoader(BaseLoader):
             root_ang_vel=root_ang_vel,
             joint_vel=joint_vel,
             extra_data=extra_data,
+            action=action,
         )
         return traj_data, source_fps, output_fps
+
+    def _extract_npz_action_labels(
+        self,
+        arrays: Mapping[str, np.ndarray],
+        source_path: Path,
+    ) -> np.ndarray | None:
+        action = arrays.get("action")
+        if action is not None:
+            return self._validate_npz_action_array(
+                np.asarray(action),
+                source_path=source_path,
+                key="action",
+            )
+
+        transition_action = arrays.get("transition_action")
+        if transition_action is None:
+            return None
+
+        frame_count = self._infer_npz_frame_count(arrays, source_path)
+        transition_action = self._validate_npz_action_array(
+            np.asarray(transition_action),
+            source_path=source_path,
+            key="transition_action",
+        )
+        if transition_action.shape[0] != frame_count - 1:
+            raise ValueError(
+                f"NPZ {source_path} has transition_action length "
+                f"{transition_action.shape[0]}, expected {frame_count - 1}."
+            )
+        return np.concatenate([transition_action, transition_action[-1:]], axis=0)
+
+    @staticmethod
+    def _validate_npz_action_array(
+        action: np.ndarray,
+        *,
+        source_path: Path,
+        key: str,
+    ) -> np.ndarray:
+        if action.ndim != 2:
+            raise ValueError(
+                f"NPZ {source_path} key '{key}' must have shape [T, A], "
+                f"got {tuple(action.shape)}."
+            )
+        if action.shape[0] == 0 or action.shape[1] == 0:
+            raise ValueError(
+                f"NPZ {source_path} key '{key}' must be non-empty, "
+                f"got {tuple(action.shape)}."
+            )
+        return action.astype(np.float32)
+
+    @staticmethod
+    def _infer_npz_frame_count(
+        arrays: Mapping[str, np.ndarray],
+        source_path: Path,
+    ) -> int:
+        for key in ("qpos", "joint_pos", "body_pos_w"):
+            value = arrays.get(key)
+            if value is not None and value.ndim > 0:
+                return int(value.shape[0])
+        raise ValueError(f"Could not infer frame count for NPZ {source_path}.")
 
     def _apply_npz_name_metadata(
         self, *, arrays: Mapping[str, np.ndarray], path: Path
@@ -960,6 +1028,7 @@ class Lafan1CsvLoader(BaseLoader):
         root_ang_vel: np.ndarray,
         joint_vel: np.ndarray,
         extra_data: Mapping[str, np.ndarray] | None,
+        action: np.ndarray | None,
     ) -> dict[str, np.ndarray]:
         qpos = np.concatenate([root_pos, root_quat, joint_pos], axis=-1).astype(
             np.float32
@@ -997,6 +1066,19 @@ class Lafan1CsvLoader(BaseLoader):
                 if value.shape[0] != qpos.shape[0]:
                     continue
                 traj_data[key] = value
+
+        if action is not None:
+            action = np.asarray(action, dtype=np.float32)
+            if action.shape[0] != qpos.shape[0]:
+                raise ValueError(
+                    "Frame-aligned action labels must match qpos length: "
+                    f"action={tuple(action.shape)}, qpos={tuple(qpos.shape)}."
+                )
+            traj_data["action"] = action
+            traj_data["last_action"] = np.concatenate(
+                [np.zeros_like(action[:1]), action[:-1]],
+                axis=0,
+            ).astype(np.float32)
 
         return traj_data
 
