@@ -2,9 +2,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from iltools.datasets.amass.loader import AmassLoader
-from iltools.datasets.loco_mujoco.loader import LocoMuJoCoLoader
-from iltools.datasets.trajopt.loader import TrajoptLoader
+from iltools.datasets.loaders import load_dataset_loader, registered_dataset_loaders
 
 app = typer.Typer(help="Imitation Learning Tools CLI")
 console = Console()
@@ -23,17 +21,28 @@ def load(
     Loads a dataset and prints its metadata.
     """
     with console.status(f"[bold green]Loading {dataset_name}...[/bold green]"):
-        if dataset_name == "amass":
-            loader = AmassLoader(data_path, model_path)
-        elif dataset_name == "loco_mujoco":
-            loader = LocoMuJoCoLoader(
+        try:
+            loader_cls = load_dataset_loader(dataset_name)
+        except KeyError:
+            choices = ", ".join(registered_dataset_loaders())
+            console.print(
+                "[bold red]"
+                f"Unknown dataset: {dataset_name}. Choices: {choices}"
+                "[/bold red]"
+            )
+            raise typer.Exit(1) from None
+        except ImportError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+
+        normalized_name = dataset_name.strip().lower().replace("-", "_")
+        if normalized_name == "loco_mujoco":
+            loader = loader_cls(
                 env_name="Humanoid", task="walk", control_freq=control_freq
             )
-        elif dataset_name == "trajopt":
-            loader = TrajoptLoader(data_path)
+        elif normalized_name in {"lafan1", "lafan1_csv"}:
+            loader = loader_cls(data_path)
         else:
-            console.print(f"[bold red]Unknown dataset: {dataset_name}[/bold red]")
-            raise typer.Exit(1)
+            loader = loader_cls(data_path)
 
         num_trajectories = len(loader)
         metadata = loader.metadata
