@@ -68,6 +68,11 @@ class UnitreeG1WBT29DofMapperConfig:
     robot_q_current_key: str = "observation.state.robot_q_current"
     robot_q_desired_key: str = "action.robot_q_desired"
     episode_key: str = "episode_index"
+    frame_key: str = "frame_index"
+    timestamp_key: str = "timestamp"
+    task_key: str = "task_index"
+    index_key: str = "index"
+    repo_index_key: str = "__lerobot_repo_index"
     dt: float = 1.0 / 30.0
     default_joint_pos: Sequence[Any] = ()
     action_scale: Sequence[float] = ()
@@ -107,6 +112,12 @@ def _to_tensor(value: Any) -> Tensor:
     if torch.is_tensor(value):
         return value.detach().to(dtype=torch.float32)
     return torch.as_tensor(value, dtype=torch.float32)
+
+
+def _to_int_tensor(value: Any) -> Tensor:
+    if torch.is_tensor(value):
+        return value.detach().to(dtype=torch.int64)
+    return torch.as_tensor(value, dtype=torch.int64)
 
 
 def _normalize_quat_wxyz(quat: Tensor, quat_order: str) -> Tensor:
@@ -191,6 +202,26 @@ def _stack_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> Tenso
     for key in keys:
         data[key] = torch.stack([_to_tensor(_get_required(row, key)) for row in rows])
     return TensorDict(data, batch_size=[len(rows)])
+
+
+def _stack_optional_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    float_keys: Sequence[str],
+    int_keys: Sequence[str],
+) -> dict[str, Tensor]:
+    data: dict[str, Tensor] = {}
+    for key in float_keys:
+        if all(_get_optional(row, key) is not None for row in rows):
+            data[key] = torch.stack(
+                [_to_tensor(_get_optional(row, key)) for row in rows]
+            )
+    for key in int_keys:
+        if all(_get_optional(row, key) is not None for row in rows):
+            data[key] = torch.stack(
+                [_to_int_tensor(_get_optional(row, key)) for row in rows]
+            )
+    return data
 
 
 def _identity_rot6d(*, length: int, device: torch.device, dtype: torch.dtype) -> Tensor:
@@ -293,6 +324,18 @@ class UnitreeG1WBT29DofMapper:
                     self.config.robot_q_desired_key,
                 ),
             )
+            episode_td.update(
+                _stack_optional_rows(
+                    episode,
+                    float_keys=(self.config.timestamp_key,),
+                    int_keys=(
+                        self.config.frame_key,
+                        self.config.task_key,
+                        self.config.index_key,
+                        self.config.repo_index_key,
+                    ),
+                )
+            )
         else:
             data = {
                 self.config.robot_q_current_key: _to_tensor(
@@ -303,8 +346,20 @@ class UnitreeG1WBT29DofMapper:
                 ),
             }
             if self.config.episode_key in episode:  # type: ignore[operator]
-                data[self.config.episode_key] = _to_tensor(  # type: ignore[index]
+                data[self.config.episode_key] = _to_int_tensor(  # type: ignore[index]
                     episode[self.config.episode_key]  # type: ignore[index]
+                )
+            for key in (
+                self.config.frame_key,
+                self.config.task_key,
+                self.config.index_key,
+                self.config.repo_index_key,
+            ):
+                if key in episode:  # type: ignore[operator]
+                    data[key] = _to_int_tensor(episode[key])  # type: ignore[index]
+            if self.config.timestamp_key in episode:  # type: ignore[operator]
+                data[self.config.timestamp_key] = _to_tensor(  # type: ignore[index]
+                    episode[self.config.timestamp_key]  # type: ignore[index]
                 )
             episode_td = TensorDict(
                 data,
@@ -391,42 +446,85 @@ class UnitreeG1WBT29DofMapper:
         done = torch.zeros(n, dtype=torch.bool, device=robot_q_current.device)
         done[-1] = True
 
-        return TensorDict(
-            {
-                ("policy", "root_pos"): root_pos[:-1],
-                ("policy", "root_quat"): root_quat[:-1],
-                ("policy", "joint_pos"): joint_pos[:-1],
-                ("policy", "base_ang_vel"): base_ang_vel[:-1],
-                ("policy", "joint_pos_rel"): joint_pos[:-1] - default_joint_pos,
-                ("policy", "joint_vel_rel"): joint_vel[:-1],
-                ("policy", "last_action"): last_action[:-1],
-                ("policy", "expert_motion"): expert_motion[:-1],
-                ("policy", "expert_anchor_pos_b"): expert_anchor_pos_b[:-1],
-                ("policy", "expert_anchor_ori_b"): expert_anchor_ori_b[:-1],
-                ("critic", "expert_motion"): expert_motion[:-1],
-                ("critic", "expert_anchor_pos_b"): expert_anchor_pos_b[:-1],
-                ("critic", "expert_anchor_ori_b"): expert_anchor_ori_b[:-1],
-                ("reward_input", "expert_motion"): expert_motion[:-1],
-                ("reward_input", "expert_anchor_pos_b"): expert_anchor_pos_b[:-1],
-                ("reward_input", "expert_anchor_ori_b"): expert_anchor_ori_b[:-1],
-                ("next", "policy", "root_pos"): root_pos[1:],
-                ("next", "policy", "root_quat"): root_quat[1:],
-                ("next", "policy", "joint_pos"): joint_pos[1:],
-                ("next", "policy", "base_ang_vel"): base_ang_vel[1:],
-                ("next", "policy", "joint_pos_rel"): joint_pos[1:] - default_joint_pos,
-                ("next", "policy", "joint_vel_rel"): joint_vel[1:],
-                ("next", "policy", "last_action"): last_action[1:],
-                ("next", "policy", "expert_motion"): expert_motion[1:],
-                ("next", "policy", "expert_anchor_pos_b"): expert_anchor_pos_b[1:],
-                ("next", "policy", "expert_anchor_ori_b"): expert_anchor_ori_b[1:],
-                "action": expert_action[:-1],
-                "expert_action": expert_action[:-1],
-                "done": done,
-                ("next", "done"): done,
-                ("next", "truncated"): torch.zeros_like(done),
-            },
-            batch_size=[n],
-        )
+        data: dict[str | tuple[str, ...], Tensor] = {
+            ("policy", "root_pos"): root_pos[:-1],
+            ("policy", "root_quat"): root_quat[:-1],
+            ("policy", "joint_pos"): joint_pos[:-1],
+            ("policy", "base_ang_vel"): base_ang_vel[:-1],
+            ("policy", "joint_pos_rel"): joint_pos[:-1] - default_joint_pos,
+            ("policy", "joint_vel_rel"): joint_vel[:-1],
+            ("policy", "last_action"): last_action[:-1],
+            ("policy", "expert_motion"): expert_motion[:-1],
+            ("policy", "expert_anchor_pos_b"): expert_anchor_pos_b[:-1],
+            ("policy", "expert_anchor_ori_b"): expert_anchor_ori_b[:-1],
+            ("critic", "expert_motion"): expert_motion[:-1],
+            ("critic", "expert_anchor_pos_b"): expert_anchor_pos_b[:-1],
+            ("critic", "expert_anchor_ori_b"): expert_anchor_ori_b[:-1],
+            ("reward_input", "expert_motion"): expert_motion[:-1],
+            ("reward_input", "expert_anchor_pos_b"): expert_anchor_pos_b[:-1],
+            ("reward_input", "expert_anchor_ori_b"): expert_anchor_ori_b[:-1],
+            ("next", "policy", "root_pos"): root_pos[1:],
+            ("next", "policy", "root_quat"): root_quat[1:],
+            ("next", "policy", "joint_pos"): joint_pos[1:],
+            ("next", "policy", "base_ang_vel"): base_ang_vel[1:],
+            ("next", "policy", "joint_pos_rel"): joint_pos[1:] - default_joint_pos,
+            ("next", "policy", "joint_vel_rel"): joint_vel[1:],
+            ("next", "policy", "last_action"): last_action[1:],
+            ("next", "policy", "expert_motion"): expert_motion[1:],
+            ("next", "policy", "expert_anchor_pos_b"): expert_anchor_pos_b[1:],
+            ("next", "policy", "expert_anchor_ori_b"): expert_anchor_ori_b[1:],
+            "action": expert_action[:-1],
+            "expert_action": expert_action[:-1],
+            "done": done,
+            ("next", "done"): done,
+            ("next", "truncated"): torch.zeros_like(done),
+        }
+        self._add_source_metadata(data, episode, n=n, like=robot_q_current)
+        return TensorDict(data, batch_size=[n])
+
+    def _add_source_metadata(
+        self,
+        data: dict[str | tuple[str, ...], Tensor],
+        episode: TensorDictBase,
+        *,
+        n: int,
+        like: Tensor,
+    ) -> None:
+        int_source_keys = {
+            "episode_index": self.config.episode_key,
+            "frame_index": self.config.frame_key,
+            "task_index": self.config.task_key,
+            "index": self.config.index_key,
+            "repo_index": self.config.repo_index_key,
+        }
+        for output_key, episode_key in int_source_keys.items():
+            value = episode.get(episode_key)
+            if value is None:
+                continue
+            value = _to_int_tensor(value).to(device=like.device)
+            if value.ndim == 0:
+                value = value.expand(n + 1)
+            if value.shape[0] != n + 1:
+                raise ValueError(
+                    f"Source metadata {episode_key!r} length must be {n + 1}, "
+                    f"got {tuple(value.shape)}."
+                )
+            data[("source", output_key)] = value[:-1]
+            data[("next", "source", output_key)] = value[1:]
+
+        timestamp = episode.get(self.config.timestamp_key)
+        if timestamp is None:
+            return
+        timestamp = _to_tensor(timestamp).to(device=like.device, dtype=like.dtype)
+        if timestamp.ndim == 0:
+            timestamp = timestamp.expand(n + 1)
+        if timestamp.shape[0] != n + 1:
+            raise ValueError(
+                f"Source metadata {self.config.timestamp_key!r} length must be "
+                f"{n + 1}, got {tuple(timestamp.shape)}."
+            )
+        data[("source", "timestamp")] = timestamp[:-1]
+        data[("next", "source", "timestamp")] = timestamp[1:]
 
 
 class StreamingTensorDictReplayCache:

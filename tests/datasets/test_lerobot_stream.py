@@ -48,6 +48,10 @@ def _make_fake_wbt_rows(
     rows = [
         {
             "episode_index": episode_index,
+            "frame_index": index,
+            "timestamp": float(index) / 30.0,
+            "task_index": 3,
+            "index": 1000 + index,
             "observation.state.robot_q_current": q_current[index],
             "action.robot_q_desired": q_desired[index],
         }
@@ -114,6 +118,24 @@ def test_unitree_g1_wbt_mapper_builds_aligned_training_transitions() -> None:
     )
     assert transitions["done"].tolist() == [False, False, False, True]
     assert transitions.get(("next", "done")).tolist() == [False, False, False, True]
+
+
+def test_unitree_g1_wbt_mapper_preserves_source_metadata() -> None:
+    mapper = _make_mapper()
+    rows, _, _ = _make_fake_wbt_rows(episode_index=7, length=5)
+    rows = [{**row, "__lerobot_repo_index": 2} for row in rows]
+
+    transitions = mapper.map_episode(rows)
+
+    assert transitions.get(("source", "repo_index")).tolist() == [2, 2, 2, 2]
+    assert transitions.get(("source", "episode_index")).tolist() == [7, 7, 7, 7]
+    assert transitions.get(("source", "frame_index")).tolist() == [0, 1, 2, 3]
+    assert transitions.get(("next", "source", "frame_index")).tolist() == [1, 2, 3, 4]
+    assert transitions.get(("source", "index")).tolist() == [1000, 1001, 1002, 1003]
+    torch.testing.assert_close(
+        transitions.get(("source", "timestamp")),
+        torch.tensor([0.0, 1.0 / 30.0, 2.0 / 30.0, 3.0 / 30.0]),
+    )
 
 
 def test_unitree_g1_wbt_mapper_selects_episode_default_from_pool() -> None:
