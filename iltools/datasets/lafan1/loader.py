@@ -209,10 +209,17 @@ class Lafan1CsvLoader(BaseLoader):
         self._configured_site_names = self._read_optional_name_list(
             ("site_names",), ("dataset", "site_names")
         )
-        self._joint_names: list[str] | None = (
-            list(self._configured_joint_names)
-            if self._configured_joint_names is not None
-            else None
+        # Native joint order is discovered from each NPZ's own ``joint_names``
+        # (authoritative). ``self._configured_joint_names`` is only a fallback for
+        # sources that carry no ``joint_names``. Leaving this ``None`` here lets
+        # file-provided names win instead of clashing with the configured fallback.
+        self._joint_names: list[str] | None = None
+        # Canonical order that every trajectory is unified to at zarr-build time
+        # (e.g. the robot articulation order). When set, joint-dim arrays are
+        # reordered native -> canonical and the zarr is labelled with the
+        # canonical order, so training-time reference/target remap is identity.
+        self._canonical_joint_names = self._read_optional_name_list(
+            ("canonical_joint_names",), ("dataset", "canonical_joint_names")
         )
         self._body_names: list[str] | None = (
             list(self._configured_body_names)
@@ -542,6 +549,9 @@ class Lafan1CsvLoader(BaseLoader):
                 traj_data, source_fps, output_fps = self._load_motion(source)
                 self._available_keys.update(traj_data.keys())
                 self._infer_or_validate_names(traj_data)
+                # Unify joint ordering to the canonical (articulation) order so the
+                # zarr is stored in a single order regardless of source.
+                traj_data = self._canonicalize_joint_order(traj_data)
 
                 traj_len = int(traj_data["qpos"].shape[0])
                 local_start = local_start_cursor
@@ -601,7 +611,7 @@ class Lafan1CsvLoader(BaseLoader):
                 e["length"] for e in trajectory_info_list
             ]
             dataset_group.attrs["keys"] = sorted(self._available_keys)
-            dataset_group.attrs["joint_names"] = self._joint_names or []
+            dataset_group.attrs["joint_names"] = self._resolve_output_joint_names()
             dataset_group.attrs["body_names"] = self._body_names or []
             dataset_group.attrs["site_names"] = self._site_names or []
             dataset_group.attrs["dt"] = self.control_dt
@@ -633,7 +643,7 @@ class Lafan1CsvLoader(BaseLoader):
             keys=sorted(self._available_keys),
             trajectory_lengths=trajectory_lengths,
             dt=self.control_dt,
-            joint_names=self._joint_names or [],
+            joint_names=self._resolve_output_joint_names(),
             body_names=self._body_names or [],
             site_names=self._site_names or [],
             metadata={
@@ -655,7 +665,15 @@ class Lafan1CsvLoader(BaseLoader):
     def _infer_or_validate_names(self, traj_data: dict[str, np.ndarray]) -> None:
         joint_count = int(traj_data["joint_pos"].shape[-1])
         if self._joint_names is None:
-            self._joint_names = [f"joint_{i}" for i in range(joint_count)]
+            if self._configured_joint_names is not None:
+                if len(self._configured_joint_names) != joint_count:
+                    raise ValueError(
+                        "configured joint_names length mismatch: expected "
+                        f"{joint_count}, got {len(self._configured_joint_names)}."
+                    )
+                self._joint_names = list(self._configured_joint_names)
+            else:
+                self._joint_names = [f"joint_{i}" for i in range(joint_count)]
         elif len(self._joint_names) != joint_count:
             raise ValueError(
                 f"joint_names length mismatch: expected {joint_count}, got {len(self._joint_names)}."
@@ -675,6 +693,63 @@ class Lafan1CsvLoader(BaseLoader):
 
         if self._site_names is None:
             self._site_names = []
+
+    def _resolve_output_joint_names(self) -> list[str]:
+        """Joint order written to the zarr.
+
+        When ``canonical_joint_names`` is configured (and length-compatible),
+        trajectories are unified to it at build time, so the stored label is the
+        canonical order; otherwise it is the discovered native order.
+        """
+        canonical = self._canonical_joint_names
+        native = self._joint_names or []
+        if canonical and len(canonical) == len(native):
+            return list(canonical)
+        return list(native)
+
+    def _canonicalize_joint_order(
+        self, traj_data: dict[str, np.ndarray]
+    ) -> dict[str, np.ndarray]:
+        """Reorder joint-dim arrays from the native order to the canonical order.
+
+        No-op when no canonical order is configured or it already matches the
+        native order. Root and body arrays carry no joint dimension and are left
+        untouched. ``qpos``/``qvel`` keep their leading root block (7 / 6) and only
+        their trailing joint block is permuted.
+        """
+        canonical = self._canonical_joint_names
+        native = self._joint_names
+        if not canonical or not native or list(native) == list(canonical):
+            return traj_data
+        if len(native) != len(canonical):
+            raise ValueError(
+                f"canonical_joint_names length ({len(canonical)}) does not match "
+                f"native joint_names ({len(native)})."
+            )
+        native_index = {name: idx for idx, name in enumerate(native)}
+        missing = [name for name in canonical if name not in native_index]
+        if missing:
+            raise ValueError(
+                f"canonical_joint_names not present in native joint_names: {missing}"
+            )
+        perm = np.asarray([native_index[name] for name in canonical], dtype=np.int64)
+        for key in ("joint_pos", "joint_vel", "next_joint_pos", "next_joint_vel"):
+            if key in traj_data:
+                traj_data[key] = np.ascontiguousarray(traj_data[key][:, perm])
+        for key, root_dim in (
+            ("qpos", 7),
+            ("qvel", 6),
+            ("next_qpos", 7),
+            ("next_qvel", 6),
+        ):
+            if key in traj_data:
+                arr = traj_data[key]
+                traj_data[key] = np.ascontiguousarray(
+                    np.concatenate(
+                        [arr[:, :root_dim], arr[:, root_dim:][:, perm]], axis=-1
+                    )
+                )
+        return traj_data
 
     def _load_motion(
         self, source: MotionSource
