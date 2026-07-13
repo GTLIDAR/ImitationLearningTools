@@ -1376,8 +1376,19 @@ class Lafan1CsvLoader(BaseLoader):
             if array.shape[0] == 0:
                 continue
 
-            chunks = [min(chunk_size, array.shape[0])] + list(array.shape[1:])
-            shards = [min(shard_size, array.shape[0])] + list(array.shape[1:])
+            # zarr v3 sharding requires the shard shape to be an exact multiple of
+            # the inner chunk shape along every dimension. For trajectories shorter
+            # than shard_size the shard collapses to the trajectory length, which is
+            # generally NOT a multiple of chunk_size (e.g. T=341, chunk=64), so round
+            # the leading shard dim down to a multiple of the leading chunk dim. Long
+            # trajectories (T >= shard_size) are unaffected (shard_size is a multiple
+            # of chunk_size by construction).
+            length = int(array.shape[0])
+            chunk_dim0 = max(1, min(chunk_size, length))
+            shard_dim0 = max(chunk_dim0, min(shard_size, length))
+            shard_dim0 = (shard_dim0 // chunk_dim0) * chunk_dim0
+            chunks = [chunk_dim0] + list(array.shape[1:])
+            shards = [shard_dim0] + list(array.shape[1:])
             ds = traj_group.create_array(
                 key,
                 shape=array.shape,
