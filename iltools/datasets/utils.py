@@ -6,7 +6,9 @@ LazyMemmapStorage on CPU or LazyTensorStorage on CUDA.
 
 from __future__ import annotations
 
+import json
 import logging
+import time
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -14,10 +16,152 @@ import numpy as np
 import torch
 import zarr
 from tensordict import TensorDict
-from torchrl.data import LazyMemmapStorage, LazyTensorStorage
+from torchrl.data import LazyMemmapStorage, LazyTensorStorage, TensorStorage
 from torchrl.data.replay_buffers import TensorDictReplayBuffer
 
 logger = logging.getLogger(f"{__name__}.utils")
+
+#: Sidecar written next to a persisted memmap buffer so it can be reopened
+#: without walking the Zarr hierarchy again.
+_PERSIST_MANIFEST_NAME = "iltools_rb_manifest.json"
+_PERSIST_FORMAT_VERSION = 1
+
+
+def _normalize_selection(x: str | Iterable[str] | None) -> list[str] | None:
+    """Canonical form of a datasets/motions/trajectories/keys selection."""
+    if x is None:
+        return None
+    if isinstance(x, str):
+        return [x]
+    return [str(item) for item in x]
+
+
+def _persist_key(
+    zarr_path: Path,
+    datasets: str | Iterable[str] | None,
+    motions: str | Iterable[str] | None,
+    trajectories: str | Iterable[str] | None,
+    keys: str | Iterable[str] | None,
+    persist_id: str | None,
+) -> dict:
+    """Identity of a persisted buffer: which Zarr content, and which slice of it.
+
+    With ``persist_id`` the identity is content-addressed and therefore
+    relocatable: a buffer built on one machine can be copied to another and
+    reopened there, even though the source Zarr lives at a different absolute
+    path (or is not present at all). Without it the absolute Zarr path is used,
+    which is safe for a build-and-train-in-place workflow but will spuriously
+    invalidate a buffer that has been moved.
+    """
+    return {
+        "source": (
+            {"persist_id": str(persist_id)}
+            if persist_id is not None
+            else {"zarr_path": str(zarr_path.resolve())}
+        ),
+        "datasets": _normalize_selection(datasets),
+        "motions": _normalize_selection(motions),
+        "trajectories": _normalize_selection(trajectories),
+        "keys": _normalize_selection(keys),
+    }
+
+
+def _load_persisted_rb(
+    persist_dir: Path,
+    expected_key: dict,
+    *,
+    device: torch.device,
+    pin_memory: bool,
+    prefetch: int,
+    batch_size: int,
+    compilable: bool,
+) -> tuple[TensorDictReplayBuffer, dict] | None:
+    """Reopen a previously persisted memmap buffer, or None if unusable.
+
+    The persisted directory is always CPU memmap files -- that is the portable
+    on-disk form. ``device`` selects where the *runtime* buffer lives: a CUDA
+    device materializes the memmap into VRAM with one sequential read, which is
+    what you want whenever the reference set fits, because sampling a memmap is
+    several times slower than sampling GPU-resident tensors.
+
+    Returns None (rather than raising) whenever the sidecar is missing, was
+    written by another format version, or describes different content, so the
+    caller can simply rebuild.
+    """
+    manifest_path = persist_dir / _PERSIST_MANIFEST_NAME
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, ValueError):
+        logger.warning("Unreadable buffer manifest at %s; rebuilding.", manifest_path)
+        return None
+
+    if manifest.get("format_version") != _PERSIST_FORMAT_VERSION:
+        logger.info("Persisted buffer format mismatch at %s; rebuilding.", persist_dir)
+        return None
+    if manifest.get("key") != expected_key:
+        logger.info(
+            "Persisted buffer at %s was built for a different Zarr or selection; "
+            "rebuilding.",
+            persist_dir,
+        )
+        return None
+
+    try:
+        td = TensorDict.load_memmap(persist_dir)
+    except Exception as err:  # noqa: BLE001 - any failure means "rebuild"
+        logger.warning("Could not memory-map %s (%s); rebuilding.", persist_dir, err)
+        return None
+
+    written = int(manifest["traj_info"]["written"])
+    if int(td.shape[0]) < written:
+        logger.warning(
+            "Persisted buffer at %s holds %s rows but its manifest claims %s; "
+            "rebuilding.",
+            persist_dir,
+            int(td.shape[0]),
+            written,
+        )
+        return None
+
+    if device.type != "cpu":
+        # One sequential read of the whole buffer, rather than the scattered
+        # page faults a memmap pays on every sample.
+        load_start = time.perf_counter()
+        td = td.to(device)
+        logger.info(
+            "Materialized persisted buffer onto %s in %.1f s.",
+            device,
+            time.perf_counter() - load_start,
+        )
+
+    storage = TensorStorage(
+        td,
+        max_size=int(manifest["traj_info"]["capacity"]),
+        device=device,
+        compilable=compilable,
+    )
+    # TensorStorage infers no write cursor from a pre-built tensordict; the
+    # buffer is read-only here, and `_len` is what bounds sampling.
+    storage._len = written
+    rb = TensorDictReplayBuffer(
+        storage=storage,
+        pin_memory=pin_memory,
+        prefetch=prefetch,
+        batch_size=batch_size,
+    )
+    traj_info = dict(manifest["traj_info"])
+    traj_info["ordered_traj_list"] = [
+        tuple(entry) for entry in traj_info["ordered_traj_list"]
+    ]
+    logger.info(
+        "Reopened persisted replay buffer at %s (%s transitions, %s trajectories).",
+        persist_dir,
+        written,
+        len(traj_info["ordered_traj_list"]),
+    )
+    return rb, traj_info
 
 
 def _is_transition_aligned_key(key: str) -> bool:
@@ -92,6 +236,9 @@ def make_rb_from(
     pin_memory: bool = True,
     prefetch: int = 0,
     batch_size: int = 1,
+    persist_dir: str | Path | None = None,
+    persist_rebuild: bool = False,
+    persist_id: str | None = None,
 ) -> tuple[TensorDictReplayBuffer, dict]:
     """Build a TorchRL replay buffer from a Zarr trajectory dataset.
 
@@ -104,11 +251,66 @@ def make_rb_from(
         device: torch device for tensors in the RB.
         existsok/compilable: passed to the underlying TorchRL storage.
         verbose_tree: print zarr tree at start.
+        persist_dir: CPU storage only. Directory holding a reusable memmap copy
+            of the filled buffer. When it already contains a matching build, the
+            buffer is memory-mapped straight from disk and the Zarr hierarchy is
+            never walked; otherwise the buffer is filled there and a sidecar
+            manifest is written for next time. This matters at scale: filling
+            costs roughly 66 ms per trajectory plus 53 us per frame, so a
+            129,785-clip reference set takes hours to fill and milliseconds to
+            memory-map.
+        persist_rebuild: ignore any existing persisted buffer and refill it.
+        persist_id: content identity for the persisted buffer, making it
+            relocatable. Set this to something that names the source *content*
+            (a manifest sha256, a dataset release tag) and the buffer can be
+            built on one machine, copied to another, and reopened there without
+            the Zarr being present at all. Leave it None only when the buffer is
+            built and consumed in place.
+
+    Note:
+        A persisted buffer is validated against ``persist_id`` (or, without one,
+        the absolute Zarr path) plus the selection arguments. It is NOT
+        invalidated by a Zarr rebuilt in place, nor by a ``persist_id`` you reuse
+        for changed content. Pass ``persist_rebuild=True`` (or delete the
+        directory) whenever the underlying content changes.
 
     Returns:
         TensorDictReplayBuffer filled with all selected transitions.
     """
     zarr_path = Path(zarr_path)
+    requested_device = torch.device(device)
+    persist_path = Path(persist_dir) if persist_dir is not None else None
+    if persist_id is not None and persist_path is None:
+        raise ValueError("persist_id is only meaningful together with persist_dir.")
+    persist_identity = (
+        _persist_key(zarr_path, datasets, motions, trajectories, keys, persist_id)
+        if persist_path is not None
+        else None
+    )
+    if persist_path is not None and not persist_rebuild:
+        cached = _load_persisted_rb(
+            persist_path,
+            persist_identity,
+            device=requested_device,
+            pin_memory=pin_memory,
+            prefetch=prefetch,
+            batch_size=batch_size,
+            compilable=compilable,
+        )
+        if cached is not None:
+            return cached
+
+    # The persisted form is always CPU memmap files: that is what is portable
+    # across machines and what can exceed VRAM. When the caller wants the
+    # runtime buffer on a GPU we still fill to disk first, then reopen through
+    # the cached path so the build and the reuse path produce the same object.
+    fill_device = requested_device
+    if persist_path is not None:
+        persist_path.mkdir(parents=True, exist_ok=True)
+        scratch_dir = persist_path
+        existsok = True
+        fill_device = torch.device("cpu")
+
     root = zarr.open(zarr_path, mode="r")
     if not isinstance(root, zarr.Group):
         raise TypeError(f"Expected Zarr Group at root, got {type(root)}")
@@ -116,7 +318,7 @@ def make_rb_from(
     if verbose_tree:
         logger.info("Zarr tree: %s", root.tree())
 
-    device_t = torch.device(device)
+    device_t = fill_device
 
     # 1) Capacity
     capacity = _compute_total_transitions(
@@ -218,13 +420,57 @@ def make_rb_from(
             "need them to match exactly."
         )
 
-    return rb, {
+    traj_info = {
         "capacity": capacity,
         "written": written,
         "start_index": start_indices,
         "end_index": end_indices,
         "ordered_traj_list": trajectory_list,
     }
+
+    if persist_path is not None:
+        # Written last, so a manifest only ever exists next to a complete fill:
+        # a job killed mid-fill leaves no manifest and the next run rebuilds.
+        manifest = {
+            "format_version": _PERSIST_FORMAT_VERSION,
+            "key": persist_identity,
+            "traj_info": {
+                **traj_info,
+                "ordered_traj_list": [list(entry) for entry in trajectory_list],
+            },
+        }
+        tmp_path = persist_path / f"{_PERSIST_MANIFEST_NAME}.tmp"
+        tmp_path.write_text(json.dumps(manifest))
+        tmp_path.replace(persist_path / _PERSIST_MANIFEST_NAME)
+        logger.info(
+            "Persisted replay buffer to %s (%s transitions, %s trajectories).",
+            persist_path,
+            written,
+            len(trajectory_list),
+        )
+
+        if requested_device != fill_device:
+            # Caller asked for a GPU-resident buffer. Re-enter through the
+            # cached reader so a fresh build and a later reuse return exactly
+            # the same object, rather than two subtly different code paths.
+            del rb
+            reopened = _load_persisted_rb(
+                persist_path,
+                persist_identity,
+                device=requested_device,
+                pin_memory=pin_memory,
+                prefetch=prefetch,
+                batch_size=batch_size,
+                compilable=compilable,
+            )
+            if reopened is None:
+                raise RuntimeError(
+                    f"Persisted buffer at {persist_path} could not be reopened "
+                    "immediately after being written."
+                )
+            return reopened
+
+    return rb, traj_info
 
 
 def make_td_from(
