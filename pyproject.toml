@@ -49,6 +49,7 @@ filterwarnings = [
 packages = ["iltools"]
 
 [tool.pyrefly]
+python-interpreter-path = "../.pixi/envs/default/bin/python"
 search-path = [
     'iltools/datasets',
     'iltools/cli',
