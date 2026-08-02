@@ -274,6 +274,35 @@ class ParallelTrajectoryManager:
     def storage_device(self) -> torch.device:
         return self._storage_device
 
+    # Public accessors for the per-trajectory index tensors and compute
+    # devices. The private attributes (``_start`` / ``_end`` / ``_length`` /
+    # ``_device`` / ``_state_device`` / ``_storage_device``) remain as
+    # aliases for legacy consumers; new code should use these properties.
+    @property
+    def start(self) -> Tensor:
+        """Per-trajectory start index (state-device int64)."""
+        return self._start
+
+    @property
+    def end(self) -> Tensor:
+        """Per-trajectory end index (state-device int64)."""
+        return self._end
+
+    @property
+    def length(self) -> Tensor:
+        """Per-trajectory length (``end - start``, clamped at zero)."""
+        return self._length
+
+    @property
+    def device(self) -> torch.device | None:
+        """Explicit compute device, or None when the buffer is the device."""
+        return self._device
+
+    @property
+    def state_device(self) -> torch.device:
+        """Device holding the trajectory-manager state tensors."""
+        return self._state_device
+
     def get_env_traj_info(self, env_id: int) -> tuple[str, str, str]:
         """Return (dataset, motion, trajectory) tuple for the env's current rank."""
         r = int(self.env_traj_rank[int(env_id)])
@@ -470,9 +499,12 @@ class ParallelTrajectoryManager:
         td.set(make_key("joint_pos"), joint_pos_out)
         td.set(make_key("joint_vel"), joint_vel_out)
 
-    def _attach_reference_fields(
-        self, td: TensorDict, *, use_buffers: bool
-    ) -> TensorDict:
+    def attach_reference_fields(self, td: TensorDict, *, use_buffers: bool) -> TensorDict:
+        """Attach root/joint reference fields to a sampled transition.
+
+        Public API; ``_attach_reference_fields`` remains as the private
+        alias for legacy consumers.
+        """
         if td.get("qpos") is None or td.get("qvel") is None:
             raise AssertionError("qpos and qvel must be present in the reference data")
 
@@ -492,6 +524,12 @@ class ParallelTrajectoryManager:
                 use_buffers=False,
             )
         return td
+
+    def _attach_reference_fields(
+        self, td: TensorDict, *, use_buffers: bool
+    ) -> TensorDict:
+        """Private alias of :meth:`attach_reference_fields`."""
+        return self.attach_reference_fields(td, use_buffers=use_buffers)
 
     def set_reconstructed_action_targets(self, action_targets: Tensor | None) -> None:
         """Register cached reconstructed action targets in target-joint order."""
