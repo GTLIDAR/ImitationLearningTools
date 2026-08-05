@@ -133,6 +133,7 @@ class ParallelTrajectoryManager:
         reset_start_step: int = 0,
         wrap_steps: bool = False,
         device: torch.device | str | None = None,
+        reset_generator: torch.Generator | None = None,
         target_joint_names: Optional[Sequence[str]] = None,
         reference_joint_names: Optional[Sequence[str]] = None,
     ) -> None:
@@ -160,6 +161,14 @@ class ParallelTrajectoryManager:
             else torch.device("cpu")
         )
         self._state_device = self._device or self._storage_device
+        if reset_generator is not None:
+            generator_device = torch.device(reset_generator.device)
+            if generator_device != self._state_device:
+                raise ValueError(
+                    "reset_generator device must match the trajectory-manager "
+                    f"state device; got {generator_device} and {self._state_device}."
+                )
+        self._reset_generator = reset_generator
 
         try:
             start = torch.as_tensor(
@@ -303,6 +312,11 @@ class ParallelTrajectoryManager:
         """Device holding the trajectory-manager state tensors."""
         return self._state_device
 
+    @property
+    def reset_generator(self) -> torch.Generator | None:
+        """Dedicated generator for trajectory/reset selection, if configured."""
+        return self._reset_generator
+
     def get_env_traj_info(self, env_id: int) -> tuple[str, str, str]:
         """Return (dataset, motion, trajectory) tuple for the env's current rank."""
         r = int(self.env_traj_rank[int(env_id)])
@@ -342,6 +356,7 @@ class ParallelTrajectoryManager:
                 size=(n,),
                 dtype=torch.int64,
                 device=env_ids.device,
+                generator=self._reset_generator,
             )
 
         if self.reset_schedule == ResetSchedule.SEQUENTIAL:
@@ -499,7 +514,9 @@ class ParallelTrajectoryManager:
         td.set(make_key("joint_pos"), joint_pos_out)
         td.set(make_key("joint_vel"), joint_vel_out)
 
-    def attach_reference_fields(self, td: TensorDict, *, use_buffers: bool) -> TensorDict:
+    def attach_reference_fields(
+        self, td: TensorDict, *, use_buffers: bool
+    ) -> TensorDict:
         """Attach root/joint reference fields to a sampled transition.
 
         Public API; ``_attach_reference_fields`` remains as the private
@@ -608,6 +625,52 @@ class ParallelTrajectoryManager:
             advance,
         )
         return self._attach_reference_fields(td, use_buffers=use_buffers)
+
+    def current_global_indices(
+        self, env_ids: Sequence[int] | Tensor | None = None
+    ) -> Tensor:
+        """Return replay indices for the current cursors without reading storage."""
+        env_ids_t = (
+            self._all_env_ids if env_ids is None else self._normalize_env_ids(env_ids)
+        )
+        ranks = self.env_traj_rank.index_select(0, env_ids_t)
+        steps = self.env_step.index_select(0, env_ids_t)
+        return get_global_index(ranks, self._start, self._end, steps)
+
+    def global_indices_for(self, ranks: Tensor, steps: Tensor) -> Tensor:
+        """Map an explicit cursor batch to replay indices without mutating state.
+
+        This is the public look-ahead boundary used by asynchronous consumers:
+        callers may plan reset cursors before committing them to environments,
+        while this manager remains the sole owner of trajectory bounds and the
+        local-to-global index convention.
+        """
+        ranks_t = torch.as_tensor(ranks, device=self._state_device, dtype=torch.int64)
+        steps_t = torch.as_tensor(steps, device=self._state_device, dtype=torch.int64)
+        if ranks_t.ndim != 1 or steps_t.ndim != 1 or ranks_t.shape != steps_t.shape:
+            raise ValueError("ranks and steps must be matching 1D tensors.")
+        if torch.any((ranks_t < 0) | (ranks_t >= self.num_trajectories)):
+            raise ValueError("ranks contains an out-of-range value.")
+        lengths = self._length.index_select(0, ranks_t)
+        if torch.any((steps_t < 0) | (steps_t >= lengths)):
+            raise ValueError("steps contains an out-of-range value.")
+        return get_global_index(ranks_t, self._start, self._end, steps_t)
+
+    def advance_cursors(
+        self, env_ids: Sequence[int] | Tensor | None = None
+    ) -> tuple[Tensor, Tensor]:
+        """Advance cursors without reading storage and return steps and indices.
+
+        The returned tensors are clones: reset handling may mutate the live
+        cursors while a caller asynchronously gathers the planned rows.
+        """
+        env_ids_t = (
+            self._all_env_ids if env_ids is None else self._normalize_env_ids(env_ids)
+        )
+        self._advance_steps(env_ids_t)
+        steps = self.env_step.index_select(0, env_ids_t).clone()
+        indices = self.current_global_indices(env_ids_t).clone()
+        return steps, indices
 
     def sample_slice(
         self,

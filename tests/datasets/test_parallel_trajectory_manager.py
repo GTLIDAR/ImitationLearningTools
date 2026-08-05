@@ -151,6 +151,99 @@ def test_parallel_trajectory_manager_direct_indexing_and_reset(tmp_path):
     assert mgr.env_traj_rank.tolist()[0] in [0, 1]
 
 
+def test_parallel_trajectory_manager_advance_cursors_without_sampling(tmp_path):
+    from iltools.datasets.manager import ParallelTrajectoryManager, ResetSchedule
+
+    rb, traj_info = _make_step_rb_and_traj_info(tmp_path, lengths=(3, 5))
+    mgr = ParallelTrajectoryManager(
+        rb=rb,
+        traj_info=traj_info,
+        num_envs=2,
+        reset_schedule=ResetSchedule.SEQUENTIAL,
+        wrap_steps=False,
+        target_joint_names=["joint1", "joint2"],
+        reference_joint_names=["joint1", "joint2"],
+    )
+    mgr.set_env_cursor(
+        env_ids=[0, 1], ranks=torch.tensor([0, 1]), steps=torch.tensor([1, 4])
+    )
+
+    steps, indices = mgr.advance_cursors()
+
+    assert steps.tolist() == [2, 4]
+    assert indices.tolist() == [2, 7]
+    assert mgr.global_indices_for(
+        torch.tensor([1, 0]), torch.tensor([3, 1])
+    ).tolist() == [6, 1]
+    # Returned plans must not alias the live cursors: reset handling is allowed
+    # to mutate the manager while an asynchronous reader consumes the plan.
+    mgr.reset_envs([0], ranks=torch.tensor([1]), steps=torch.tensor([0]))
+    assert steps.tolist() == [2, 4]
+    assert indices.tolist() == [2, 7]
+
+
+def test_parallel_trajectory_manager_maps_planned_cursors_without_mutation(tmp_path):
+    from iltools.datasets.manager import ParallelTrajectoryManager, ResetSchedule
+
+    rb, traj_info = _make_step_rb_and_traj_info(tmp_path, lengths=(3, 5))
+    mgr = ParallelTrajectoryManager(
+        rb=rb,
+        traj_info=traj_info,
+        num_envs=2,
+        reset_schedule=ResetSchedule.SEQUENTIAL,
+        target_joint_names=["joint1", "joint2"],
+        reference_joint_names=["joint1", "joint2"],
+    )
+    original_ranks = mgr.env_traj_rank.clone()
+    original_steps = mgr.env_step.clone()
+
+    indices = mgr.global_indices_for(torch.tensor([1, 0]), torch.tensor([4, 2]))
+
+    assert indices.tolist() == [7, 2]
+    torch.testing.assert_close(mgr.env_traj_rank, original_ranks)
+    torch.testing.assert_close(mgr.env_step, original_steps)
+    with pytest.raises(ValueError, match="matching 1D"):
+        mgr.global_indices_for(torch.tensor([[0]]), torch.tensor([0]))
+    with pytest.raises(ValueError, match="ranks"):
+        mgr.global_indices_for(torch.tensor([2]), torch.tensor([0]))
+    with pytest.raises(ValueError, match="steps"):
+        mgr.global_indices_for(torch.tensor([0]), torch.tensor([3]))
+
+
+def test_parallel_trajectory_manager_reset_generator_is_dedicated(tmp_path):
+    from iltools.datasets.manager import ParallelTrajectoryManager, ResetSchedule
+
+    rb, traj_info = _make_dummy_rb_and_traj_info(tmp_path, lengths=(3, 5, 4))
+
+    def _manager(seed: int) -> ParallelTrajectoryManager:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        return ParallelTrajectoryManager(
+            rb=rb,
+            traj_info=traj_info,
+            num_envs=8,
+            reset_schedule=ResetSchedule.RANDOM,
+            reset_generator=generator,
+            target_joint_names=["joint1", "joint2"],
+            reference_joint_names=["joint1", "joint2"],
+        )
+
+    torch.manual_seed(1)
+    first = _manager(123)
+    first_initial = first.env_traj_rank.clone()
+    first.reset_envs(torch.arange(8))
+    first_next = first.env_traj_rank.clone()
+
+    torch.manual_seed(9999)
+    second = _manager(123)
+    second_initial = second.env_traj_rank.clone()
+    second.reset_envs(torch.arange(8))
+    second_next = second.env_traj_rank.clone()
+
+    torch.testing.assert_close(first_initial, second_initial)
+    torch.testing.assert_close(first_next, second_next)
+
+
 def test_parallel_trajectory_manager_round_robin(tmp_path):
     from iltools.datasets.manager import ParallelTrajectoryManager, ResetSchedule
 
