@@ -98,6 +98,47 @@ def test_random_full_trajectory_starts_apply_sonic_lead_in() -> None:
     assert torch.any(lead_in_steps == 0)
 
 
+def test_sonic_dedicated_generator_is_independent_of_global_rng() -> None:
+    lengths = torch.tensor([500, 260])
+
+    def _sample(global_seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+        torch.manual_seed(global_seed)
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(77)
+        sampler = SonicAdaptiveResetSampler(lengths, generator=generator)
+        return sampler.sample(512)
+
+    first_ranks, first_steps = _sample(1)
+    second_ranks, second_steps = _sample(9999)
+    torch.testing.assert_close(first_ranks, second_ranks)
+    torch.testing.assert_close(first_steps, second_steps)
+
+
+def test_sonic_probability_snapshot_is_not_changed_by_later_failures() -> None:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(19)
+    sampler = SonicAdaptiveResetSampler(
+        torch.tensor([100, 100]),
+        pre_failure_sample_window=0,
+        generator=generator,
+    )
+    snapshot = sampler.sampling_probabilities().clone()
+    sampler.num_visits.fill_(100.0)
+    sampler.num_failures.fill_(1.0)
+    sampler.num_failures[-1] = 100.0
+
+    ranks, steps = sampler.sample(4096, probabilities=snapshot)
+    # The frozen initial distribution is balanced across the equal-length
+    # motions even though the live distribution now overwhelmingly favors 1.
+    first_fraction = (ranks == 0).float().mean()
+    assert 0.45 < first_fraction < 0.55
+    assert torch.all(steps >= 0)
+    assert torch.all(steps < 100)
+
+    with pytest.raises(ValueError, match="one entry per SONIC bin"):
+        sampler.sample(1, probabilities=torch.ones(3))
+
+
 # ---------------------------------------------------------------------------
 # StartFrameSampler: fixed / random modes.
 # ---------------------------------------------------------------------------
@@ -141,6 +182,25 @@ def test_random_mode_with_single_value_is_fixed() -> None:
         random_step_max=7,
     )
     assert sampler.sample_steps(torch.tensor([0])).tolist() == [7]
+
+
+def test_start_frame_dedicated_generator_is_independent_of_global_rng() -> None:
+    ranks = torch.tensor([0, 1, 0, 1, 0, 1, 0, 1])
+
+    def _sample(global_seed: int) -> torch.Tensor:
+        torch.manual_seed(global_seed)
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(91)
+        sampler = StartFrameSampler(
+            torch.tensor([100, 100]),
+            mode="random",
+            random_step_min=10,
+            random_step_max=20,
+            generator=generator,
+        )
+        return sampler.sample_steps(ranks)
+
+    torch.testing.assert_close(_sample(2), _sample(2000))
 
 
 def test_empty_rank_batch_returns_empty() -> None:
@@ -204,14 +264,14 @@ def test_adaptive_mode_falls_back_to_uniform_for_zero_weight_rows() -> None:
     torch.manual_seed(3)
     steps = sampler.sample_steps(torch.tensor([0, 1, 0, 1]))
     assert torch.all(steps >= 0)
-    assert torch.all(steps < torch.tensor([100, 60]).index_select(0, torch.tensor([0, 1, 0, 1])))
+    assert torch.all(
+        steps < torch.tensor([100, 60]).index_select(0, torch.tensor([0, 1, 0, 1]))
+    )
 
 
 def test_adaptive_mode_sanitizes_non_finite_weights() -> None:
     def nan_weights(ranks: torch.Tensor, steps: torch.Tensor) -> torch.Tensor:
-        return torch.full(
-            (ranks.numel(),), float("nan"), device=ranks.device
-        )
+        return torch.full((ranks.numel(),), float("nan"), device=ranks.device)
 
     sampler = StartFrameSampler(
         torch.tensor([100]),
@@ -289,9 +349,7 @@ def test_adaptive_frames_follow_recorded_failures() -> None:
     failures in one bin must shift the sampled frame distribution toward it.
     """
     lengths = torch.tensor([200, 200])
-    sonic = SonicAdaptiveResetSampler(
-        lengths, bin_size=50, pre_failure_sample_window=0
-    )
+    sonic = SonicAdaptiveResetSampler(lengths, bin_size=50, pre_failure_sample_window=0)
     frame_sampler = StartFrameSampler(
         lengths, mode="adaptive", weight_fn=sonic, device="cpu"
     )
