@@ -73,14 +73,13 @@ class StartFrameSampler:
         random_step_max: int = 0,
         weight_fn: WeightFunction | None = None,
         device: torch.device | str | None = None,
+        generator: torch.Generator | None = None,
     ) -> None:
         lengths = torch.as_tensor(
             trajectory_lengths, dtype=torch.long, device=trajectory_lengths.device
         ).reshape(-1)
         if lengths.numel() == 0:
-            raise ValueError(
-                "trajectory_lengths must contain at least one trajectory."
-            )
+            raise ValueError("trajectory_lengths must contain at least one trajectory.")
         if torch.any(lengths <= 0):
             raise ValueError("trajectory_lengths must all be positive.")
 
@@ -101,25 +100,25 @@ class StartFrameSampler:
                 "adaptive starting-frame mode requires a weight_fn callable."
             )
         if mode != self.ADAPTIVE and weight_fn is not None:
-            raise ValueError(
-                "weight_fn is only used in adaptive starting-frame mode."
-            )
+            raise ValueError("weight_fn is only used in adaptive starting-frame mode.")
 
-        self._device = (
-            torch.device(device) if device is not None else lengths.device
-        )
+        self._device = torch.device(device) if device is not None else lengths.device
         self.trajectory_lengths = lengths.to(self._device)
         self.mode = mode
         self.fixed_step = int(fixed_step)
         self.random_step_min = int(random_step_min)
         self.random_step_max = int(random_step_max)
         self.weight_fn = weight_fn
+        if generator is not None and torch.device(generator.device) != self._device:
+            raise ValueError(
+                "generator device must match the sampler device; got "
+                f"{torch.device(generator.device)} and {self._device}."
+            )
+        self.generator = generator
 
     def _clamp_steps(self, ranks: torch.Tensor, steps: torch.Tensor) -> torch.Tensor:
         max_steps = self.trajectory_lengths.index_select(0, ranks) - 1
-        return torch.minimum(
-            torch.maximum(steps, torch.zeros_like(steps)), max_steps
-        )
+        return torch.minimum(torch.maximum(steps, torch.zeros_like(steps)), max_steps)
 
     def sample_steps(self, trajectory_ranks: torch.Tensor) -> torch.Tensor:
         """Sample one local starting frame per requested trajectory rank.
@@ -151,6 +150,7 @@ class StartFrameSampler:
                     (n,),
                     device=self._device,
                     dtype=torch.long,
+                    generator=self.generator,
                 )
             else:
                 steps = torch.full(
@@ -195,7 +195,7 @@ class StartFrameSampler:
             fallback[zero_rows] = valid[zero_rows].to(torch.float32)
             weights = torch.where(zero_rows[:, None], fallback, weights)
         probs = weights / weights.sum(dim=-1, keepdim=True)
-        return torch.multinomial(probs, 1).squeeze(-1)
+        return torch.multinomial(probs, 1, generator=self.generator).squeeze(-1)
 
 
 class SonicAdaptiveResetSampler:
@@ -229,6 +229,7 @@ class SonicAdaptiveResetSampler:
         uniform_sampling_rate: float = 0.1,
         pre_failure_sample_window: int = 200,
         failure_rate_max_over_mean: float = 200.0,
+        generator: torch.Generator | None = None,
     ) -> None:
         lengths = torch.as_tensor(
             trajectory_lengths,
@@ -236,9 +237,7 @@ class SonicAdaptiveResetSampler:
             device=trajectory_lengths.device,
         ).reshape(-1)
         if lengths.numel() == 0:
-            raise ValueError(
-                "trajectory_lengths must contain at least one trajectory."
-            )
+            raise ValueError("trajectory_lengths must contain at least one trajectory.")
         if torch.any(lengths <= 0):
             raise ValueError("trajectory_lengths must all be positive.")
         if int(bin_size) <= 0:
@@ -259,6 +258,12 @@ class SonicAdaptiveResetSampler:
         self.uniform_sampling_rate = float(uniform_sampling_rate)
         self.pre_failure_sample_window = int(pre_failure_sample_window)
         self.failure_rate_max_over_mean = float(failure_rate_max_over_mean)
+        if generator is not None and torch.device(generator.device) != self.device:
+            raise ValueError(
+                "generator device must match the sampler device; got "
+                f"{torch.device(generator.device)} and {self.device}."
+            )
+        self.generator = generator
 
         bins: list[torch.Tensor] = []
         trajectory_bin_ids: list[torch.Tensor] = []
@@ -325,9 +330,7 @@ class SonicAdaptiveResetSampler:
         if torch.any((ranks < 0) | (ranks >= self.trajectory_lengths.numel())):
             raise ValueError("trajectory_ranks contains an out-of-range value.")
         max_steps = self.trajectory_lengths.index_select(0, ranks) - 1
-        steps = torch.minimum(
-            torch.maximum(steps, torch.zeros_like(steps)), max_steps
-        )
+        steps = torch.minimum(torch.maximum(steps, torch.zeros_like(steps)), max_steps)
         local_bins = torch.div(steps, self.bin_size, rounding_mode="floor")
         return self.first_bin_ids.index_select(0, ranks) + local_bins
 
@@ -381,10 +384,9 @@ class SonicAdaptiveResetSampler:
         bin_ids = self._bin_ids(trajectory_ranks, frame_steps)
         bin_probs = self.sampling_probabilities()
         bin_lengths = self.bin_lengths
-        return (
-            bin_probs.index_select(0, bin_ids)
-            / bin_lengths.index_select(0, bin_ids).to(dtype=torch.float32)
-        )
+        return bin_probs.index_select(0, bin_ids) / bin_lengths.index_select(
+            0, bin_ids
+        ).to(dtype=torch.float32)
 
     def __call__(
         self, trajectory_ranks: torch.Tensor, frame_steps: torch.Tensor
@@ -392,23 +394,53 @@ class SonicAdaptiveResetSampler:
         """Callable alias of :meth:`weights` for use as a ``weight_fn``."""
         return self.weights(trajectory_ranks, frame_steps)
 
-    def sample(self, count: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample trajectory ranks and random local starts with SONIC's lead-in."""
+    def sample(
+        self,
+        count: int,
+        *,
+        probabilities: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample trajectory ranks and local starts with SONIC's lead-in.
+
+        ``probabilities`` may hold a caller-owned snapshot of the bin
+        distribution. This makes the sampling-time contract explicit for
+        asynchronous consumers instead of racing later failure updates.
+        """
         count = int(count)
         if count < 0:
             raise ValueError("count must be >= 0.")
         if count == 0:
             empty = torch.empty(0, device=self.device, dtype=torch.long)
             return empty, empty
+        if probabilities is None:
+            probabilities = self.sampling_probabilities()
+        else:
+            probabilities = torch.as_tensor(
+                probabilities, device=self.device, dtype=torch.float32
+            )
+            if probabilities.shape != (self.num_bins,):
+                raise ValueError(
+                    "probabilities must have one entry per SONIC bin; expected "
+                    f"{(self.num_bins,)}, got {tuple(probabilities.shape)}."
+                )
+            if not torch.all(torch.isfinite(probabilities)):
+                raise ValueError("probabilities must be finite")
+            if torch.any(probabilities < 0) or probabilities.sum() <= 0:
+                raise ValueError("probabilities must be non-negative with positive sum")
+            probabilities = probabilities / probabilities.sum()
         sampled_bin_ids = torch.multinomial(
-            self.sampling_probabilities(), count, replacement=True
+            probabilities,
+            count,
+            replacement=True,
+            generator=self.generator,
         )
         sampled_bins = self.bins.index_select(0, sampled_bin_ids)
         trajectory_ranks = sampled_bins[:, 0]
         bin_starts = sampled_bins[:, 1]
         bin_ends = sampled_bins[:, 2]
         frame_steps = (
-            torch.rand(count, device=self.device) * (bin_ends - bin_starts)
+            torch.rand(count, device=self.device, generator=self.generator)
+            * (bin_ends - bin_starts)
         ).floor().to(torch.long) + bin_starts
         if self.pre_failure_sample_window > 0:
             lead_in = torch.randint(
@@ -416,6 +448,7 @@ class SonicAdaptiveResetSampler:
                 (count,),
                 device=self.device,
                 dtype=torch.long,
+                generator=self.generator,
             )
             frame_steps = (frame_steps - lead_in).clamp_min(0)
         return trajectory_ranks, frame_steps
