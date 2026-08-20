@@ -1,52 +1,50 @@
-"""Optional Pinocchio position IK for robot-model retargeting."""
+"""Model-based keypoint retargeting with damped-least-squares MuJoCo IK."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import importlib
+from pathlib import Path
 from typing import Any, Sequence
 
+import mujoco as _mujoco
 import numpy as np
 
-try:
-    pin: Any = importlib.import_module("pinocchio")
-except ImportError:  # pragma: no cover - optional dependency
-    pin = None
-
 from iltools.core.trajectory import Trajectory
-from iltools.retarget.base_retarget import BaseRetarget
 
 from .keypoint_retarget import _retargeted_trajectory
 
+mujoco: Any = _mujoco
+
 
 @dataclass(frozen=True, slots=True)
-class PinocchioPositionTaskSpec:
-    """Map one named source keypoint to one Pinocchio frame."""
+class MujocoPositionTaskSpec:
+    """Map one source keypoint to one MuJoCo site position."""
 
     source_keypoint: str
-    target_frame: str
+    target_site: str
     weight: float = 1.0
 
     def __post_init__(self) -> None:
-        if not self.source_keypoint or not self.target_frame:
-            raise ValueError("Pinocchio position task names must be non-empty.")
+        if not self.source_keypoint or not self.target_site:
+            raise ValueError("MuJoCo position task names must be non-empty.")
         if not np.isfinite(self.weight) or self.weight <= 0.0:
-            raise ValueError("Pinocchio position task weight must be positive.")
+            raise ValueError("MuJoCo position task weight must be positive.")
 
 
-class PinocchioKeypointRetargeter(BaseRetarget):
-    """Retarget robot-frame keypoints to bounded scalar Pinocchio joints.
+class MujocoKeypointRetargeter:
+    """Retarget source keypoints to bounded robot joints with MuJoCo IK.
 
-    The solver uses the previous frame as the next seed. It updates only the
-    requested one-DoF joints and uses frame-position Jacobians, so it does not
-    silently change an unlisted robot joint or floating base state.
+    The source keypoints and target MuJoCo sites must use the same coordinate
+    frame. The solver updates only single-DOF hinge or slide joints listed in
+    ``target_joint_names``. It uses the previous frame as the next seed, which
+    keeps the result temporally continuous for egocentric motion clips.
     """
 
     def __init__(
         self,
-        robot_model: Any,
+        model: mujoco.MjModel | str | Path,
         target_joint_names: Sequence[str],
-        tasks: Sequence[PinocchioPositionTaskSpec],
+        tasks: Sequence[MujocoPositionTaskSpec],
         *,
         source_key: str = "keypoints",
         target_key: str = "qpos",
@@ -56,14 +54,14 @@ class PinocchioKeypointRetargeter(BaseRetarget):
         tolerance: float = 1.0e-4,
         initial_qpos: Sequence[float] | None = None,
     ) -> None:
-        if pin is None:
-            raise ImportError(
-                "PinocchioKeypointRetargeter requires the optional `pinocchio` "
-                "package. Use MujocoKeypointRetargeter for MJCF assets."
-            )
-        self._pin: Any = pin
-        self.robot_model = robot_model
-        self.robot_data = robot_model.createData()
+        if isinstance(model, (str, Path)):
+            model_path = Path(model).expanduser().resolve()
+            if not model_path.is_file():
+                raise FileNotFoundError(f"MuJoCo model not found: {model_path}")
+            self.model = mujoco.MjModel.from_xml_path(str(model_path))
+        else:
+            self.model = model
+
         self.target_joint_names = tuple(target_joint_names)
         self.tasks = tuple(tasks)
         self.source_key = source_key
@@ -73,15 +71,10 @@ class PinocchioKeypointRetargeter(BaseRetarget):
         ):
             raise ValueError("target_joint_names must be non-empty and unique.")
         if not self.tasks:
-            raise ValueError("At least one Pinocchio position task is required.")
+            raise ValueError("At least one MuJoCo position task is required.")
         if iterations < 1:
             raise ValueError("iterations must be positive.")
-        if (
-            not np.isfinite((damping, max_step, tolerance)).all()
-            or damping <= 0.0
-            or max_step <= 0.0
-            or tolerance <= 0.0
-        ):
+        if not np.isfinite((damping, max_step, tolerance)).all() or damping <= 0.0:
             raise ValueError(
                 "damping, max_step, and tolerance must be finite and positive."
             )
@@ -91,42 +84,41 @@ class PinocchioKeypointRetargeter(BaseRetarget):
         self.tolerance = float(tolerance)
 
         self._joint_ids = np.asarray(
-            [robot_model.getJointId(name) for name in self.target_joint_names],
-            dtype=np.int64,
+            [self.model.joint(name).id for name in self.target_joint_names],
+            dtype=np.int32,
         )
-        if np.any(self._joint_ids <= 0):
-            raise ValueError("All target_joint_names must resolve to real joints.")
         unsupported = [
             name
             for name, joint_id in zip(
                 self.target_joint_names, self._joint_ids, strict=True
             )
-            if robot_model.nqs[int(joint_id)] != 1
-            or robot_model.nvs[int(joint_id)] != 1
+            if int(self.model.jnt_type[joint_id])
+            not in (
+                int(mujoco.mjtJoint.mjJNT_HINGE),
+                int(mujoco.mjtJoint.mjJNT_SLIDE),
+            )
         ]
         if unsupported:
             raise ValueError(
-                "Pinocchio keypoint retargeting supports scalar joints only: "
+                "MuJoCo keypoint retargeting supports hinge/slide joints only: "
                 f"{unsupported}"
             )
         self._qpos_indices = np.asarray(
-            [robot_model.idx_qs[int(joint_id)] for joint_id in self._joint_ids],
-            dtype=np.int64,
+            self.model.jnt_qposadr[self._joint_ids], dtype=np.int32
         )
         self._dof_indices = np.asarray(
-            [robot_model.idx_vs[int(joint_id)] for joint_id in self._joint_ids],
-            dtype=np.int64,
+            self.model.jnt_dofadr[self._joint_ids], dtype=np.int32
         )
-        self._frame_ids = tuple(
-            robot_model.getFrameId(task.target_frame) for task in self.tasks
+        self._site_ids = tuple(
+            self.model.site(task.target_site).id for task in self.tasks
         )
-        if any(frame_id >= robot_model.nframes for frame_id in self._frame_ids):
-            raise ValueError("All Pinocchio target frames must resolve to real frames.")
         self._task_weights = np.repeat(
             np.sqrt(np.asarray([task.weight for task in self.tasks])), 3
         )
 
-        self._base_qpos = pin.neutral(robot_model)
+        data = mujoco.MjData(self.model)
+        mujoco.mj_resetData(self.model, data)
+        self._base_qpos = data.qpos.copy()
         if initial_qpos is None:
             self._initial_qpos = self._base_qpos[self._qpos_indices].copy()
         else:
@@ -139,33 +131,42 @@ class PinocchioKeypointRetargeter(BaseRetarget):
                 )
             if not np.isfinite(self._initial_qpos).all():
                 raise ValueError("initial_qpos contains non-finite values.")
-        self._lower = np.asarray(robot_model.lowerPositionLimit)[self._qpos_indices]
-        self._upper = np.asarray(robot_model.upperPositionLimit)[self._qpos_indices]
+        self._lower, self._upper = self._joint_limits()
+
+    def _joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
+        lower = np.full(len(self._joint_ids), -np.inf, dtype=np.float64)
+        upper = np.full(len(self._joint_ids), np.inf, dtype=np.float64)
+        for index, joint_id in enumerate(self._joint_ids):
+            if self.model.jnt_limited[joint_id]:
+                lower[index], upper[index] = self.model.jnt_range[joint_id]
+        return lower, upper
 
     def _solve_frame(
         self,
+        data: mujoco.MjData,
         source_points: dict[str, np.ndarray],
         seed: np.ndarray,
     ) -> np.ndarray:
         q = np.array(seed, dtype=np.float64, copy=True)
         for _ in range(self.iterations):
-            self._pin.forwardKinematics(self.robot_model, self.robot_data, q)
-            self._pin.updateFramePlacements(self.robot_model, self.robot_data)
+            data.qpos[:] = self._base_qpos
+            data.qpos[self._qpos_indices] = q
+            mujoco.mj_forward(self.model, data)
             errors: list[np.ndarray] = []
             jacobians: list[np.ndarray] = []
-            for task, frame_id in zip(self.tasks, self._frame_ids, strict=True):
+            for task, site_id in zip(self.tasks, self._site_ids, strict=True):
                 target = source_points[task.source_keypoint]
-                current = self.robot_data.oMf[frame_id].translation
-                errors.append(target - current)
-                jacobian = self._pin.computeFrameJacobian(
-                    self.robot_model,
-                    self.robot_data,
-                    q,
-                    frame_id,
-                    self._pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+                errors.append(target - data.site_xpos[site_id])
+                jacobian_position = np.zeros((3, self.model.nv), dtype=np.float64)
+                jacobian_rotation = np.zeros((3, self.model.nv), dtype=np.float64)
+                mujoco.mj_jacSite(
+                    self.model,
+                    data,
+                    jacobian_position,
+                    jacobian_rotation,
+                    site_id,
                 )
-                jacobian = np.asarray(jacobian).reshape(6, self.robot_model.nv)
-                jacobians.append(jacobian[:3, self._dof_indices])
+                jacobians.append(jacobian_position[:, self._dof_indices])
             error = np.concatenate(errors) * self._task_weights
             if np.linalg.norm(error) <= self.tolerance:
                 break
@@ -176,19 +177,14 @@ class PinocchioKeypointRetargeter(BaseRetarget):
             norm = float(np.linalg.norm(delta))
             if norm > self.max_step:
                 delta *= self.max_step / norm
-            full_delta = np.zeros(self.robot_model.nv, dtype=np.float64)
-            full_delta[self._dof_indices] = delta
-            q = self._pin.integrate(self.robot_model, q, full_delta)
-            q[self._qpos_indices] = np.clip(
-                q[self._qpos_indices], self._lower, self._upper
-            )
+            q = np.clip(q + delta, self._lower, self._upper)
         return q
 
     def retarget(self, trajectory: Trajectory) -> Trajectory:
         coordinate_frame = (trajectory.infos or {}).get("coordinate_frame")
         if coordinate_frame != "robot":
             raise ValueError(
-                "Pinocchio keypoint retargeting requires keypoints in the robot "
+                "MuJoCo keypoint retargeting requires keypoints in the robot "
                 "model frame. Apply transform_keypoint_trajectory first; "
                 f"got coordinate_frame={coordinate_frame!r}."
             )
@@ -216,28 +212,20 @@ class PinocchioKeypointRetargeter(BaseRetarget):
         if not np.isfinite(points).all():
             raise ValueError(f"{self.source_key!r} contains non-finite values.")
 
+        data = mujoco.MjData(self.model)
         qpos = np.empty((len(points), len(self.target_joint_names)), dtype=np.float64)
-        q = self._base_qpos.copy()
-        q[self._qpos_indices] = self._initial_qpos
+        seed = self._initial_qpos
         for frame_index, frame in enumerate(points):
             named_points = {name: frame[index] for name, index in point_index.items()}
-            q = self._solve_frame(named_points, q)
-            qpos[frame_index] = q[self._qpos_indices]
+            seed = self._solve_frame(data, named_points, seed)
+            qpos[frame_index] = seed
         return _retargeted_trajectory(
             trajectory,
             qpos,
             target_key=self.target_key,
             target_joint_names=self.target_joint_names,
-            method="pinocchio_dls_keypoint",
+            method="mujoco_dls_keypoint",
         )
 
 
-class PinocchioRetarget(PinocchioKeypointRetargeter):
-    """Backwards-compatible name for the Pinocchio keypoint retargeter."""
-
-
-__all__ = [
-    "PinocchioKeypointRetargeter",
-    "PinocchioPositionTaskSpec",
-    "PinocchioRetarget",
-]
+__all__ = ["MujocoKeypointRetargeter", "MujocoPositionTaskSpec"]
