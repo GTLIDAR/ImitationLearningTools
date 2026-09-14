@@ -151,6 +151,28 @@ def test_parallel_trajectory_manager_direct_indexing_and_reset(tmp_path):
     assert mgr.env_traj_rank.tolist()[0] in [0, 1]
 
 
+def test_parallel_trajectory_manager_cursor_only_from_lengths() -> None:
+    from iltools.datasets.manager import ParallelTrajectoryManager, ResetSchedule
+
+    mgr = ParallelTrajectoryManager.from_lengths(
+        [3, 5],
+        num_envs=2,
+        reset_schedule=ResetSchedule.SEQUENTIAL,
+        device="cpu",
+    )
+
+    assert mgr.rb is None
+    assert mgr.env_traj_rank.tolist() == [0, 1]
+    mgr.set_env_cursor(
+        env_ids=torch.tensor([0, 1]),
+        ranks=torch.tensor([1, 0]),
+        steps=torch.tensor([4, 1]),
+    )
+    steps, indices = mgr.advance_cursors()
+    assert steps.tolist() == [4, 2]
+    assert indices.tolist() == [7, 2]
+
+
 def test_parallel_trajectory_manager_advance_cursors_without_sampling(tmp_path):
     from iltools.datasets.manager import ParallelTrajectoryManager, ResetSchedule
 

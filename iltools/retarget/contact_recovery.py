@@ -119,7 +119,12 @@ class ContactRecoveryReport:
         }
 
 
-def _geom_id(model: Any, name: str) -> int:
+def _geom_id(model: Any, name: str | int) -> int:
+    if isinstance(name, (int, np.integer)):
+        geom_id = int(name)
+        if not 0 <= geom_id < int(model.ngeom):
+            raise ValueError(f"The model has no geom id {geom_id}.")
+        return geom_id
     geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
     if geom_id < 0:
         raise ValueError(f"The model has no geom named {name!r}.")
@@ -132,8 +137,8 @@ def recover_contact_sequence(
     *,
     qpos: np.ndarray,
     qpos_addresses: Sequence[int],
-    object_geom_names: Sequence[str],
-    fingertip_geom_names: Mapping[str, Sequence[str]],
+    object_geom_names: Sequence[str | int],
+    fingertip_geom_names: Mapping[str, Sequence[str | int]],
     contact_link_names: Mapping[str, Sequence[str]],
     source_active: np.ndarray,
     object_mocap_poses: np.ndarray | None = None,
@@ -187,11 +192,11 @@ def recover_contact_sequence(
         if len(fingertip_geom_names[side]) != len(contact_link_names[side]):
             raise ValueError(f"{side} geom and link name counts differ.")
 
-    object_geoms = [_geom_id(model, str(name)) for name in object_geom_names]
+    object_geoms = [_geom_id(model, name) for name in object_geom_names]
     if not object_geoms:
         raise ValueError("object_geom_names must name at least one object geom.")
     side_geoms = {
-        side: [_geom_id(model, str(name)) for name in fingertip_geom_names[side]]
+        side: [_geom_id(model, name) for name in fingertip_geom_names[side]]
         for side in sides
     }
 

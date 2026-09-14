@@ -16,6 +16,7 @@ from .dexterous_reference import (
     load_dexterous_reference_npz,
     load_dexterous_reference_set,
     save_dexterous_reference_npz,
+    sha256_file,
     verify_training_qualification,
 )
 from .trajectory import Trajectory
@@ -37,5 +38,6 @@ __all__ = [
     "load_dexterous_reference_npz",
     "load_dexterous_reference_set",
     "save_dexterous_reference_npz",
+    "sha256_file",
     "verify_training_qualification",
 ]

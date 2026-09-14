@@ -100,6 +100,8 @@ def test_dual_hand_retargeter_solves_wrist_pose_and_clips_fingers() -> None:
         iterations=150,
         damping=0.005,
         tolerance=1.0e-7,
+        previous_posture_weight=1.0e-6,
+        neutral_posture_weight=1.0e-7,
     )
 
     result = retargeter.retarget(source)
@@ -115,6 +117,8 @@ def test_dual_hand_retargeter_solves_wrist_pose_and_clips_fingers() -> None:
     assert result.infos["retarget"]["method"] == "mujoco_dual_wrist_se3"
     assert result.infos["retarget"]["left_wrist_frame_name"] == "left_wrist"
     assert result.infos["retarget"]["right_wrist_frame_name"] == "right_wrist"
+    assert result.infos["retarget"]["previous_posture_weight"] == 1.0e-6
+    assert result.infos["retarget"]["neutral_posture_weight"] == 1.0e-7
 
     reference = dexterous_reference_from_trajectory(
         result,
@@ -152,6 +156,52 @@ def test_dual_hand_retargeter_solves_wrist_pose_and_clips_fingers() -> None:
     )
     assert reference.metadata["source_coordinate_frame"] == "robot"
     assert reference.collision_asset_dependencies[0].uri == "collision.obj"
+
+
+def test_position_priority_does_not_trade_wrist_position_for_orientation() -> None:
+    model = _model()
+    left_position_pose, right_position_pose = _wrist_poses(
+        model, np.zeros(2), np.zeros(2)
+    )
+    left_orientation_pose, right_orientation_pose = _wrist_poses(
+        model, np.full(2, 0.8), np.full(2, -0.8)
+    )
+    left_target = left_position_pose.copy()
+    right_target = right_position_pose.copy()
+    left_target[:, 3:7] = left_orientation_pose[:, 3:7]
+    right_target[:, 3:7] = right_orientation_pose[:, 3:7]
+    source = Trajectory(
+        observations={
+            "left_wrist_pose_w": left_target,
+            "right_wrist_pose_w": right_target,
+            "left_finger_qpos": np.zeros((2, 1)),
+            "right_finger_qpos": np.zeros((2, 1)),
+        },
+        infos={"coordinate_frame": "robot"},
+    )
+    retargeter = MujocoDualHandRetargeter(
+        model,
+        target_joint_names=(
+            "left_arm",
+            "right_arm",
+            "left_finger",
+            "right_finger",
+        ),
+        arm_joint_names=("left_arm", "right_arm"),
+        left_finger_joint_names=("left_finger",),
+        right_finger_joint_names=("right_finger",),
+        left_wrist_site="left_wrist",
+        right_wrist_site="right_wrist",
+        iterations=20,
+        damping=0.005,
+        orientation_weight=10.0,
+        position_priority=True,
+    )
+
+    result = retargeter.retarget(source)
+
+    np.testing.assert_allclose(result.observations["qpos"][:, :2], 0.0, atol=1e-10)
+    assert result.infos["retarget"]["position_priority"] is True
 
 
 def test_reference_boundary_rotates_robot_frame_object_twists_to_world() -> None:

@@ -38,7 +38,7 @@ def _fixture():
     return model, data, [int(model.jnt_qposadr[joint])]
 
 
-def _recover(centre_gaps, *, activity=None, config=None):
+def _recover(centre_gaps, *, activity=None, config=None, use_geom_ids=False):
     """Run recovery with the tip placed at each requested centre gap."""
 
     model, data, addresses = _fixture()
@@ -55,8 +55,12 @@ def _recover(centre_gaps, *, activity=None, config=None):
         data,
         qpos=qpos,
         qpos_addresses=addresses,
-        object_geom_names=["object_geom"],
-        fingertip_geom_names={"right": ["right_tip"]},
+        object_geom_names=[
+            model.geom("object_geom").id if use_geom_ids else "object_geom"
+        ],
+        fingertip_geom_names={
+            "right": [model.geom("right_tip").id if use_geom_ids else "right_tip"]
+        },
         contact_link_names={"right": ["r_index_finger_distal"]},
         source_active=np.asarray(activity, dtype=bool),
         object_mocap_poses=poses,
@@ -77,6 +81,13 @@ def test_a_touching_fingertip_yields_measured_witness_points() -> None:
     object_point = sequence.object_positions_w[0, 0, 0]
     assert link_point == pytest.approx([0.25, 0.0, 0.0], abs=1e-6)
     assert object_point == pytest.approx([0.25, 0.0, 0.0], abs=1e-6)
+
+
+def test_contact_recovery_accepts_unnamed_geom_ids() -> None:
+    sequence, report = _recover([TOUCH_SEPARATION], use_geom_ids=True)
+
+    assert bool(sequence.active[0, 0, 0])
+    assert report.recovered_contacts == 1
 
 
 def test_normals_are_unit_and_oppositely_directed() -> None:

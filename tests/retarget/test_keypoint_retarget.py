@@ -12,6 +12,8 @@ from iltools.retarget import (
     load_ego_pose_bundle,
     load_ego_pose_trajectory,
     merge_joint_trajectories,
+    MujocoKeypointProjectionConfig,
+    MujocoKeypointProjector,
     MujocoKeypointRetargeter,
     MujocoPositionTaskSpec,
     PinocchioKeypointRetargeter,
@@ -300,6 +302,63 @@ def test_mujoco_keypoint_retargeter_solves_position_task() -> None:
         data.site_xpos[model.site("tip").id], [1.4, 0.8, 0.0], atol=1.0e-3
     )
     assert result.infos["retarget"]["method"] == "mujoco_dls_keypoint"
+
+
+def test_mujoco_keypoint_projector_preserves_nonvariable_seed() -> None:
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_string(
+        """
+        <mujoco>
+          <compiler angle="radian"/>
+          <worldbody>
+            <body name="base">
+              <joint name="hold" type="slide" axis="0 0 1" range="-1 1"/>
+              <joint name="joint_a" type="hinge" axis="0 0 1" range="-3.14 3.14"/>
+              <geom type="sphere" size="0.1" mass="1"/>
+              <body pos="1 0 0">
+                <joint name="joint_b" type="hinge" axis="0 0 1" range="-3.14 3.14"/>
+                <geom type="sphere" size="0.1" mass="1"/>
+                <site name="tip" pos="1 0 0"/>
+              </body>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+    )
+    joint_names = ("hold", "joint_a", "joint_b")
+    qpos = np.asarray([[0.25, 0.0, 0.0], [0.25, 0.0, 0.0]])
+    targets = np.asarray([[[1.4, 0.8, 0.25]], [[1.2, 1.2, 0.25]]])
+    projector = MujocoKeypointProjector(
+        model,
+        trajectory_joint_names=joint_names,
+        variable_joint_names=("joint_a", "joint_b"),
+        target_site_names=("tip",),
+        config=MujocoKeypointProjectionConfig(
+            iterations=200,
+            damping=0.02,
+            regularization=1.0e-6,
+            max_step=0.12,
+            tolerance_m=1.0e-4,
+        ),
+    )
+
+    projected, report = projector.project(qpos, target_positions=targets)
+
+    np.testing.assert_allclose(projected[:, 0], qpos[:, 0])
+    data = mujoco.MjData(model)
+    addresses = np.asarray(
+        [model.jnt_qposadr[model.joint(name).id] for name in joint_names]
+    )
+    for frame, row in enumerate(projected):
+        data.qpos[addresses] = row
+        mujoco.mj_forward(model, data)
+        np.testing.assert_allclose(
+            data.site_xpos[model.site("tip").id], targets[frame, 0], atol=1.0e-3
+        )
+    assert report.active_targets == 2
+    assert report.converged_frames == 2
+    assert report.as_dict()["max_final_error_m"] < 1.0e-3
 
 
 def test_pinocchio_keypoint_retargeter_solves_position_task() -> None:

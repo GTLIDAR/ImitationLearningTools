@@ -24,7 +24,8 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 
-REFERENCE_SCHEMA_VERSION = "iltools_dexterous_reference/v1"
+REFERENCE_SCHEMA_VERSION = "iltools_dexterous_reference/v2"
+LEGACY_REFERENCE_SCHEMA_VERSION = "iltools_dexterous_reference/v1"
 MANIFEST_SCHEMA_VERSION = "iltools_dexterous_reference_manifest/v1"
 TRAINING_QUALIFICATION_SCHEMA_VERSION = "iltools_dexterous_training_qualification/v2"
 _LEGACY_TRAINING_QUALIFICATION_SCHEMA_VERSION = (
@@ -163,14 +164,58 @@ def _decode_string_array(value: np.ndarray) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _resolve_asset_paths(values: Sequence[str], *, base_dir: Path) -> tuple[str, ...]:
+MAX_ASSET_RELOCATION_DEPTH = 6
+"""How far above a Reference file relocation looks for a moved scene asset."""
+
+
+def _relocated_asset(recorded: Path, base_dir: Path, digest: str) -> Path | None:
+    """Find a moved scene asset near ``base_dir`` whose content matches ``digest``.
+
+    A Reference records absolute asset paths, so a set copied to another host
+    (a cluster bind, another checkout) points at paths that no longer exist.
+    This searches the Reference's own directory and a bounded number of its
+    parents for the tail of the recorded path, longest tail first.
+
+    A candidate is accepted only when its SHA-256 equals the recorded digest,
+    so relocation never weakens the hash-bound contract: it changes where a
+    file may be found, never whether its content is the declared one. Without
+    a recorded digest there is nothing to verify against and the caller keeps
+    the original path.
+    """
+
+    if not digest:
+        return None
+    roots = [base_dir, *list(base_dir.parents)[:MAX_ASSET_RELOCATION_DEPTH]]
+    parts = recorded.parts
+    # Longest tail first: the most specific match wins, so a bare basename
+    # collision elsewhere in the tree cannot shadow the real asset.
+    for depth in range(min(len(parts), MAX_ASSET_RELOCATION_DEPTH + 1), 0, -1):
+        tail = Path(*parts[-depth:])
+        for root in roots:
+            candidate = root / tail
+            if candidate.is_file() and sha256_file(candidate) == digest:
+                return candidate.resolve()
+    return None
+
+
+def _resolve_asset_paths(
+    values: Sequence[str],
+    *,
+    base_dir: Path,
+    digests: Sequence[str] = (),
+) -> tuple[str, ...]:
     result: list[str] = []
-    for value in values:
+    for index, value in enumerate(values):
         if not value or "://" in value:
             result.append(value)
             continue
         path = Path(value).expanduser()
         resolved = path.resolve() if path.is_absolute() else (base_dir / path).resolve()
+        if not resolved.is_file():
+            digest = str(digests[index]).lower() if index < len(digests) else ""
+            relocated = _relocated_asset(resolved, base_dir, digest)
+            if relocated is not None:
+                resolved = relocated
         result.append(str(resolved))
     return tuple(result)
 
@@ -958,7 +1003,14 @@ class ContactSequence:
 
 @dataclass(slots=True)
 class DexterousReference:
-    """One fixed-base robot reference with hands, objects, and contacts."""
+    """One robot reference with hands, objects, and contacts.
+
+    ``robot_layout`` distinguishes the historical fixed-base robot layout from
+    the dual free-floating hand layout used by Sharpa V2D.  In the dual-hand
+    layout, ``qpos`` and ``qvel`` contain all left finger joints followed by all
+    right finger joints.  Wrist motion is stored separately as poses and
+    world-frame twists.
+    """
 
     sequence_id: str
     robot_name: str
@@ -972,6 +1024,11 @@ class DexterousReference:
     right_wrist_frame_name: str
     object_names: tuple[str, ...]
     object_poses_w: np.ndarray
+    robot_layout: str = "fixed_base"
+    left_joint_names: tuple[str, ...] = ()
+    right_joint_names: tuple[str, ...] = ()
+    left_wrist_twist_w: np.ndarray | None = None
+    right_wrist_twist_w: np.ndarray | None = None
     qvel: np.ndarray | None = None
     object_twists_w: np.ndarray | None = None
     object_asset_paths: tuple[str, ...] = ()
@@ -1000,6 +1057,10 @@ class DexterousReference:
             raise ValueError(
                 f"Unsupported reference schema {self.schema_version!r}; "
                 f"expected {REFERENCE_SCHEMA_VERSION!r}."
+            )
+        if self.robot_layout not in {"fixed_base", "dual_floating_hand"}:
+            raise ValueError(
+                "robot_layout must be 'fixed_base' or 'dual_floating_hand'."
             )
         if not self.sequence_id or not self.robot_name:
             raise ValueError("sequence_id and robot_name must be non-empty.")
@@ -1035,6 +1096,25 @@ class DexterousReference:
                 shape=(frame_count, joint_count),
             )
 
+        self.left_joint_names = _string_tuple(
+            self.left_joint_names, name="left_joint_names"
+        )
+        self.right_joint_names = _string_tuple(
+            self.right_joint_names, name="right_joint_names"
+        )
+        if self.robot_layout == "dual_floating_hand":
+            if not self.left_joint_names or not self.right_joint_names:
+                raise ValueError(
+                    "dual_floating_hand references require left_joint_names and "
+                    "right_joint_names."
+                )
+            expected_joint_names = self.left_joint_names + self.right_joint_names
+            if self.joint_names != expected_joint_names:
+                raise ValueError(
+                    "dual_floating_hand joint_names must be left_joint_names "
+                    "followed by right_joint_names."
+                )
+
         self.fixed_root_pose_w = _array(
             self.fixed_root_pose_w,
             dtype=np.float32,
@@ -1053,6 +1133,28 @@ class DexterousReference:
             name="right_wrist_pose_w",
             shape=(frame_count, 7),
         )
+        if self.left_wrist_twist_w is None:
+            self.left_wrist_twist_w = derive_object_twists_w(
+                self.left_wrist_pose_w[:, None, :], self.fps
+            )[:, 0, :]
+        else:
+            self.left_wrist_twist_w = _array(
+                self.left_wrist_twist_w,
+                dtype=np.float32,
+                name="left_wrist_twist_w",
+                shape=(frame_count, 6),
+            )
+        if self.right_wrist_twist_w is None:
+            self.right_wrist_twist_w = derive_object_twists_w(
+                self.right_wrist_pose_w[:, None, :], self.fps
+            )[:, 0, :]
+        else:
+            self.right_wrist_twist_w = _array(
+                self.right_wrist_twist_w,
+                dtype=np.float32,
+                name="right_wrist_twist_w",
+                shape=(frame_count, 6),
+            )
         wrist_frame_names = _string_tuple(
             (self.left_wrist_frame_name, self.right_wrist_frame_name),
             name="wrist frame names",
@@ -1545,13 +1647,18 @@ def save_dexterous_reference_npz(
         "schema_version": np.asarray(reference.schema_version),
         "sequence_id": np.asarray(reference.sequence_id),
         "robot_name": np.asarray(reference.robot_name),
+        "robot_layout": np.asarray(reference.robot_layout),
         "fps": np.asarray(reference.fps, dtype=np.float32),
         "joint_names": np.asarray(reference.joint_names),
         "qpos": reference.qpos,
         "qvel": reference.qvel,
+        "left_joint_names": np.asarray(reference.left_joint_names),
+        "right_joint_names": np.asarray(reference.right_joint_names),
         "fixed_root_pose_w": reference.fixed_root_pose_w,
         "left_wrist_pose_w": reference.left_wrist_pose_w,
         "right_wrist_pose_w": reference.right_wrist_pose_w,
+        "left_wrist_twist_w": reference.left_wrist_twist_w,
+        "right_wrist_twist_w": reference.right_wrist_twist_w,
         "left_wrist_frame_name": np.asarray(reference.left_wrist_frame_name),
         "right_wrist_frame_name": np.asarray(reference.right_wrist_frame_name),
         "object_names": np.asarray(reference.object_names),
@@ -1688,17 +1795,40 @@ def load_dexterous_reference_npz(path: str | Path) -> DexterousReference:
             CollisionAssetDependency.from_dict(item) for item in dependency_payload
         )
 
+    loaded_schema = _scalar_string(fields["schema_version"], name="schema_version")
+    if loaded_schema not in {REFERENCE_SCHEMA_VERSION, LEGACY_REFERENCE_SCHEMA_VERSION}:
+        raise ValueError(
+            f"Unsupported reference schema {loaded_schema!r}; expected "
+            f"{REFERENCE_SCHEMA_VERSION!r} or {LEGACY_REFERENCE_SCHEMA_VERSION!r}."
+        )
     return DexterousReference(
-        schema_version=_scalar_string(fields["schema_version"], name="schema_version"),
+        schema_version=REFERENCE_SCHEMA_VERSION,
         sequence_id=_scalar_string(fields["sequence_id"], name="sequence_id"),
         robot_name=_scalar_string(fields["robot_name"], name="robot_name"),
+        robot_layout=(
+            _scalar_string(fields["robot_layout"], name="robot_layout")
+            if "robot_layout" in fields
+            else "fixed_base"
+        ),
         fps=float(np.asarray(fields["fps"]).reshape(())),
         joint_names=_decode_string_array(fields["joint_names"]),
         qpos=fields["qpos"],
         qvel=fields.get("qvel"),
+        left_joint_names=(
+            _decode_string_array(fields["left_joint_names"])
+            if "left_joint_names" in fields
+            else ()
+        ),
+        right_joint_names=(
+            _decode_string_array(fields["right_joint_names"])
+            if "right_joint_names" in fields
+            else ()
+        ),
         fixed_root_pose_w=fields["fixed_root_pose_w"],
         left_wrist_pose_w=fields["left_wrist_pose_w"],
         right_wrist_pose_w=fields["right_wrist_pose_w"],
+        left_wrist_twist_w=fields.get("left_wrist_twist_w"),
+        right_wrist_twist_w=fields.get("right_wrist_twist_w"),
         left_wrist_frame_name=_scalar_string(
             fields["left_wrist_frame_name"], name="left_wrist_frame_name"
         ),
@@ -1715,6 +1845,11 @@ def load_dexterous_reference_npz(path: str | Path) -> DexterousReference:
                 else ()
             ),
             base_dir=source.parent,
+            digests=(
+                _decode_string_array(fields["object_asset_sha256"])
+                if "object_asset_sha256" in fields
+                else ()
+            ),
         ),
         object_asset_sha256=(
             _decode_string_array(fields["object_asset_sha256"])
@@ -1747,6 +1882,11 @@ def load_dexterous_reference_npz(path: str | Path) -> DexterousReference:
                 else ()
             ),
             base_dir=source.parent,
+            digests=(
+                _decode_string_array(fields["support_surface_asset_sha256"])
+                if "support_surface_asset_sha256" in fields
+                else ()
+            ),
         ),
         support_surface_asset_sha256=(
             _decode_string_array(fields["support_surface_asset_sha256"])

@@ -139,6 +139,7 @@ def settle_contact_trajectory(
     robot_geom_names: Sequence[str],
     object_mocap_poses: np.ndarray | None = None,
     object_mocap_body_names: Sequence[str] | None = None,
+    mocap_poses: Mapping[str, np.ndarray] | None = None,
     config: ContactSettlingConfig | None = None,
 ) -> tuple[np.ndarray, ContactSettlingReport]:
     """Press a retargeted trajectory onto the object and return what it achieves.
@@ -152,6 +153,10 @@ def settle_contact_trajectory(
         robot_geom_names: Robot geoms to measure penetration on.
         object_mocap_poses: Object poses ``[T, B, 7]`` as XYZ+WXYZ.
         object_mocap_body_names: Mocap body for each tracked object.
+        mocap_poses: Any further mocap bodies to drive, as name to ``[T, 7]``
+            XYZ+WXYZ poses. Use it to hold a floating hand's root: a mocap
+            body has infinite mass, so the wrist stays exactly on the
+            retarget while contact moves the fingers alone.
         config: Settling behaviour.
 
     Returns:
@@ -211,6 +216,22 @@ def settle_contact_trajectory(
                 raise ValueError(f"Body {str(name)!r} is not a mocap body.")
             mocap_ids.append(mocap_id)
 
+    extra_mocap: list[tuple[int, np.ndarray]] = []
+    for name, values in (mocap_poses or {}).items():
+        array = np.asarray(values, dtype=np.float64)
+        if array.shape != (frame_count, 7):
+            raise ValueError(
+                f"mocap_poses[{name!r}] must have shape [{frame_count}, 7], "
+                f"got {array.shape}."
+            )
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, str(name))
+        if body_id < 0:
+            raise ValueError(f"The model has no body named {str(name)!r}.")
+        mocap_id = int(model.body_mocapid[body_id])
+        if mocap_id < 0:
+            raise ValueError(f"Body {str(name)!r} is not a mocap body.")
+        extra_mocap.append((mocap_id, array))
+
     saved_gravity = np.array(model.opt.gravity, dtype=np.float64)
     saved_gain = np.array(model.actuator_gainprm, dtype=np.float64)
     saved_bias = np.array(model.actuator_biasprm, dtype=np.float64)
@@ -241,6 +262,9 @@ def settle_contact_trajectory(
                 for index, mocap_id in enumerate(mocap_ids):
                     data.mocap_pos[mocap_id] = poses[frame, index, :3]
                     data.mocap_quat[mocap_id] = poses[frame, index, 3:7]
+            for mocap_id, array in extra_mocap:
+                data.mocap_pos[mocap_id] = array[frame, :3]
+                data.mocap_quat[mocap_id] = array[frame, 3:7]
             data.ctrl[actuators] = target[frame]
 
             mujoco.mj_forward(model, data)

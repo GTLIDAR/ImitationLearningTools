@@ -280,6 +280,35 @@ def test_loading_legacy_pose_only_npz_derives_object_twists(tmp_path) -> None:
     np.testing.assert_allclose(loaded.object_twists_w[..., 0], 0.5)
 
 
+def test_reference_schema_v1_loads_as_fixed_base_v2(tmp_path) -> None:
+    current = save_dexterous_reference_npz(_make_reference(), tmp_path / "current.npz")
+    v2_only = {
+        "robot_layout",
+        "left_joint_names",
+        "right_joint_names",
+        "left_wrist_twist_w",
+        "right_wrist_twist_w",
+    }
+    with np.load(current, allow_pickle=False) as archive:
+        fields = {
+            name: np.asarray(archive[name])
+            for name in archive.files
+            if name not in v2_only
+        }
+    fields["schema_version"] = np.asarray("iltools_dexterous_reference/v1")
+    legacy = tmp_path / "legacy_v1_reference.npz"
+    np.savez(legacy, **fields)
+
+    loaded = load_dexterous_reference_npz(legacy)
+
+    assert loaded.schema_version == "iltools_dexterous_reference/v2"
+    assert loaded.robot_layout == "fixed_base"
+    assert loaded.left_joint_names == ()
+    assert loaded.right_joint_names == ()
+    assert loaded.left_wrist_twist_w.shape == (loaded.frame_count, 6)
+    assert loaded.right_wrist_twist_w.shape == (loaded.frame_count, 6)
+
+
 def test_scene_asset_hash_verification_is_strict_and_content_bound(tmp_path) -> None:
     object_path = tmp_path / "cube.usda"
     support_path = tmp_path / "table.usda"
@@ -961,3 +990,98 @@ def test_contact_rejects_duplicate_named_link_within_hand() -> None:
             object_indices=contacts.object_indices,
             active=contacts.active,
         )
+
+
+def _relocation_reference(tmp_path, asset_dir_name="assets"):
+    """A dual-hand reference whose object asset lives in a sibling tree."""
+
+    from iltools.core import sha256_file
+
+    asset_dir = tmp_path / "home" / "sharpa" / asset_dir_name / "box"
+    asset_dir.mkdir(parents=True)
+    asset = asset_dir / "object.urdf"
+    asset.write_text("<robot name='box'><link name='object'/></robot>", "utf-8")
+    frames = 2
+    identity = np.zeros((frames, 4), dtype=np.float32)
+    identity[:, 0] = 1.0
+    reference = DexterousReference(
+        sequence_id="relocatable",
+        robot_name="sharpa_wave",
+        fps=20.0,
+        joint_names=("j0",),
+        qpos=np.zeros((frames, 1), dtype=np.float32),
+        fixed_root_pose_w=np.asarray([0, 0, 0, 1, 0, 0, 0], dtype=np.float32),
+        left_wrist_pose_w=np.concatenate(
+            (np.zeros((frames, 3), dtype=np.float32), identity), axis=-1
+        ),
+        right_wrist_pose_w=np.concatenate(
+            (np.zeros((frames, 3), dtype=np.float32), identity), axis=-1
+        ),
+        left_wrist_frame_name="left_hand_C_MC",
+        right_wrist_frame_name="right_hand_C_MC",
+        object_names=("box",),
+        object_poses_w=np.concatenate(
+            (np.zeros((frames, 1, 3), dtype=np.float32), identity[:, None]), axis=-1
+        ),
+        object_asset_paths=(str(asset),),
+        object_asset_sha256=(sha256_file(asset),),
+    )
+    return reference, asset
+
+
+def test_a_relocated_asset_tree_still_resolves_and_verifies(tmp_path):
+    """A Reference set copied to another root finds its asset by content."""
+
+    reference, _asset = _relocation_reference(tmp_path)
+    save_dexterous_reference_npz(
+        reference, tmp_path / "home" / "sharpa" / "set" / "references" / "00000.npz"
+    )
+    # Move the whole tree, exactly as staging to a cluster bind does.
+    moved = tmp_path / "data" / "sharpa"
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "home" / "sharpa").rename(moved)
+
+    loaded = load_dexterous_reference_npz(moved / "set" / "references" / "00000.npz")
+    assert loaded.object_asset_paths[0] == str(moved / "assets" / "box" / "object.urdf")
+    loaded.verify_scene_assets(require_hashes=True)
+
+
+def test_relocation_refuses_a_same_named_file_with_other_content(tmp_path):
+    """Only content decides; a decoy with the recorded name is not accepted."""
+
+    reference, _asset = _relocation_reference(tmp_path)
+    save_dexterous_reference_npz(
+        reference, tmp_path / "home" / "sharpa" / "set" / "references" / "00000.npz"
+    )
+    moved = tmp_path / "data" / "sharpa"
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "home" / "sharpa").rename(moved)
+    # Same path tail, different bytes.
+    (moved / "assets" / "box" / "object.urdf").write_text("<robot/>", "utf-8")
+
+    loaded = load_dexterous_reference_npz(moved / "set" / "references" / "00000.npz")
+    with pytest.raises(FileNotFoundError):
+        loaded.verify_scene_assets(require_hashes=True)
+
+
+def test_relocation_needs_a_recorded_hash(tmp_path):
+    """Without a declared digest there is nothing to verify, so nothing moves."""
+
+    from iltools.core.dexterous_reference import _relocated_asset
+
+    recorded = tmp_path / "gone" / "assets" / "box" / "object.urdf"
+    base = tmp_path / "set" / "references"
+    base.mkdir(parents=True)
+    assert _relocated_asset(recorded, base, "") is None
+
+
+def test_an_existing_asset_path_is_left_alone(tmp_path):
+    """Relocation is a fallback; a resolvable path is never rewritten."""
+
+    reference, asset = _relocation_reference(tmp_path)
+    npz = save_dexterous_reference_npz(
+        reference, tmp_path / "home" / "sharpa" / "set" / "references" / "00000.npz"
+    )
+    loaded = load_dexterous_reference_npz(npz)
+    assert loaded.object_asset_paths[0] == str(asset)
+    loaded.verify_scene_assets(require_hashes=True)

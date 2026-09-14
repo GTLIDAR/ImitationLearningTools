@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -29,6 +29,70 @@ class MujocoPositionTaskSpec:
             raise ValueError("MuJoCo position task names must be non-empty.")
         if not np.isfinite(self.weight) or self.weight <= 0.0:
             raise ValueError("MuJoCo position task weight must be positive.")
+
+
+@dataclass(frozen=True)
+class MujocoKeypointProjectionConfig:
+    """Numerical settings for projecting sites onto trajectory keypoints."""
+
+    iterations: int = 100
+    damping: float = 0.03
+    regularization: float = 0.001
+    max_step: float = 0.08
+    tolerance_m: float = 0.001
+    line_search_steps: int = 8
+
+    def __post_init__(self) -> None:
+        if int(self.iterations) < 1 or int(self.line_search_steps) < 1:
+            raise ValueError("iterations and line_search_steps must be positive.")
+        for name in (
+            "damping",
+            "regularization",
+            "max_step",
+            "tolerance_m",
+        ):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+
+
+@dataclass
+class MujocoKeypointProjectionReport:
+    """Residual and correction evidence for trajectory keypoint projection."""
+
+    frame_count: int = 0
+    active_targets: int = 0
+    converged_frames: int = 0
+    initial_errors_m: list[float] = field(default_factory=list)
+    final_errors_m: list[float] = field(default_factory=list)
+    joint_shifts: list[float] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "frame_count": self.frame_count,
+            "active_targets": self.active_targets,
+            "converged_frames": self.converged_frames,
+            "mean_initial_error_m": (
+                float(np.mean(self.initial_errors_m)) if self.initial_errors_m else 0.0
+            ),
+            "mean_final_error_m": (
+                float(np.mean(self.final_errors_m)) if self.final_errors_m else 0.0
+            ),
+            "p95_final_error_m": (
+                float(np.percentile(self.final_errors_m, 95.0))
+                if self.final_errors_m
+                else 0.0
+            ),
+            "max_final_error_m": (
+                float(np.max(self.final_errors_m)) if self.final_errors_m else 0.0
+            ),
+            "mean_joint_shift": (
+                float(np.mean(self.joint_shifts)) if self.joint_shifts else 0.0
+            ),
+            "max_joint_shift": (
+                float(np.max(self.joint_shifts)) if self.joint_shifts else 0.0
+            ),
+        }
 
 
 class MujocoKeypointRetargeter:
@@ -228,4 +292,235 @@ class MujocoKeypointRetargeter:
         )
 
 
-__all__ = ["MujocoKeypointRetargeter", "MujocoPositionTaskSpec"]
+class MujocoKeypointProjector:
+    """Fit named robot sites while preserving a full trajectory seed."""
+
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        *,
+        trajectory_joint_names: Sequence[str],
+        variable_joint_names: Sequence[str],
+        target_site_names: Sequence[str],
+        task_weights: Sequence[float] | None = None,
+        config: MujocoKeypointProjectionConfig | None = None,
+    ) -> None:
+        self.model = model
+        self.data = mujoco.MjData(model)
+        self.config = config or MujocoKeypointProjectionConfig()
+        self.trajectory_joint_names = tuple(
+            str(name) for name in trajectory_joint_names
+        )
+        self.variable_joint_names = tuple(str(name) for name in variable_joint_names)
+        self.target_site_names = tuple(str(name) for name in target_site_names)
+        if not self.trajectory_joint_names or len(
+            set(self.trajectory_joint_names)
+        ) != len(self.trajectory_joint_names):
+            raise ValueError("trajectory_joint_names must be non-empty and unique.")
+        if not self.variable_joint_names or len(set(self.variable_joint_names)) != len(
+            self.variable_joint_names
+        ):
+            raise ValueError("variable_joint_names must be non-empty and unique.")
+        if not self.target_site_names or len(set(self.target_site_names)) != len(
+            self.target_site_names
+        ):
+            raise ValueError("target_site_names must be non-empty and unique.")
+        columns = {
+            name: index for index, name in enumerate(self.trajectory_joint_names)
+        }
+        missing = set(self.variable_joint_names) - set(columns)
+        if missing:
+            raise ValueError(f"Variable joints are absent from trajectory: {missing}.")
+        self.joint_ids = np.asarray(
+            [self.model.joint(name).id for name in self.trajectory_joint_names],
+            dtype=np.int32,
+        )
+        self.qpos_addresses = np.asarray(
+            self.model.jnt_qposadr[self.joint_ids], dtype=np.int32
+        )
+        self.variable_columns = np.asarray(
+            [columns[name] for name in self.variable_joint_names], dtype=np.int32
+        )
+        variable_joint_ids = self.joint_ids[self.variable_columns]
+        unsupported = [
+            name
+            for name, joint_id in zip(
+                self.variable_joint_names, variable_joint_ids, strict=True
+            )
+            if int(self.model.jnt_type[joint_id])
+            not in (
+                int(mujoco.mjtJoint.mjJNT_HINGE),
+                int(mujoco.mjtJoint.mjJNT_SLIDE),
+            )
+        ]
+        if unsupported:
+            raise ValueError(
+                "MuJoCo keypoint projection supports hinge/slide joints only: "
+                f"{unsupported}"
+            )
+        self.variable_dofs = np.asarray(
+            self.model.jnt_dofadr[variable_joint_ids], dtype=np.int32
+        )
+        limited = np.asarray(self.model.jnt_limited[variable_joint_ids], dtype=bool)
+        self.lower = np.where(
+            limited,
+            self.model.jnt_range[variable_joint_ids, 0],
+            -np.inf,
+        ).astype(np.float64)
+        self.upper = np.where(
+            limited,
+            self.model.jnt_range[variable_joint_ids, 1],
+            np.inf,
+        ).astype(np.float64)
+        self.site_ids = tuple(
+            self.model.site(name).id for name in self.target_site_names
+        )
+        if task_weights is None:
+            self.task_weights = np.ones(len(self.site_ids), dtype=np.float64)
+        else:
+            self.task_weights = np.asarray(task_weights, dtype=np.float64)
+            if (
+                self.task_weights.shape != (len(self.site_ids),)
+                or np.any(~np.isfinite(self.task_weights))
+                or np.any(self.task_weights <= 0.0)
+            ):
+                raise ValueError(
+                    "task_weights must be finite, positive, and align with sites."
+                )
+
+    def _set_q(self, row: np.ndarray) -> None:
+        self.data.qpos[self.qpos_addresses] = row
+        mujoco.mj_forward(self.model, self.data)
+
+    def _errors(self, targets: np.ndarray, active: np.ndarray) -> np.ndarray:
+        return np.asarray(
+            [
+                targets[index] - self.data.site_xpos[site_id]
+                for index, site_id in enumerate(self.site_ids)
+                if active[index]
+            ],
+            dtype=np.float64,
+        )
+
+    def project(
+        self,
+        qpos: np.ndarray,
+        *,
+        target_positions: np.ndarray,
+        active: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, MujocoKeypointProjectionReport]:
+        """Project active sites and return a temporally seeded report."""
+
+        values = np.asarray(qpos, dtype=np.float64)
+        targets = np.asarray(target_positions, dtype=np.float64)
+        if values.ndim != 2 or values.shape[1] != len(self.trajectory_joint_names):
+            raise ValueError("qpos must have shape [T, trajectory joints].")
+        if targets.shape != (len(values), len(self.site_ids), 3):
+            raise ValueError("target_positions must have shape [T, sites, 3].")
+        valid = (
+            np.ones((len(values), len(self.site_ids)), dtype=bool)
+            if active is None
+            else np.asarray(active, dtype=bool)
+        )
+        if valid.shape != targets.shape[:2]:
+            raise ValueError("active must have shape [T, sites].")
+        if not np.isfinite(values).all() or not np.isfinite(targets).all():
+            raise ValueError("qpos/target_positions contain non-finite values.")
+
+        output = values.copy()
+        report = MujocoKeypointProjectionReport(frame_count=len(output))
+        jacp = np.zeros((3, self.model.nv), dtype=np.float64)
+        jacr = np.zeros((3, self.model.nv), dtype=np.float64)
+        for frame, row in enumerate(output):
+            if not np.any(valid[frame]):
+                continue
+            seed = row.copy()
+            self._set_q(row)
+            initial = self._errors(targets[frame], valid[frame])
+            report.initial_errors_m.extend(np.linalg.norm(initial, axis=1))
+            report.active_targets += len(initial)
+            for _ in range(self.config.iterations):
+                self._set_q(row)
+                raw_errors = self._errors(targets[frame], valid[frame])
+                if (
+                    float(np.max(np.linalg.norm(raw_errors, axis=1)))
+                    <= self.config.tolerance_m
+                ):
+                    break
+                errors: list[np.ndarray] = []
+                jacobians: list[np.ndarray] = []
+                for index, site_id in enumerate(self.site_ids):
+                    if not valid[frame, index]:
+                        continue
+                    weight = float(np.sqrt(self.task_weights[index]))
+                    errors.append(
+                        weight * (targets[frame, index] - self.data.site_xpos[site_id])
+                    )
+                    jacp.fill(0.0)
+                    jacr.fill(0.0)
+                    mujoco.mj_jacSite(self.model, self.data, jacp, jacr, site_id)
+                    jacobians.append(weight * jacp[:, self.variable_dofs])
+                error = np.concatenate(errors)
+                jacobian = np.vstack(jacobians)
+                normal = jacobian.T @ jacobian
+                normal += (
+                    self.config.damping**2 + self.config.regularization
+                ) * np.eye(len(self.variable_columns))
+                current = row[self.variable_columns].copy()
+                right = jacobian.T @ error + self.config.regularization * (
+                    seed[self.variable_columns] - current
+                )
+                delta = np.linalg.solve(normal, right)
+                norm = float(np.linalg.norm(delta))
+                if norm > self.config.max_step:
+                    delta *= self.config.max_step / norm
+                current_objective = float(
+                    error @ error
+                ) + self.config.regularization * float(
+                    np.sum((current - seed[self.variable_columns]) ** 2)
+                )
+                accepted = False
+                for search_step in range(self.config.line_search_steps):
+                    row[self.variable_columns] = np.clip(
+                        current + 0.5**search_step * delta,
+                        self.lower,
+                        self.upper,
+                    )
+                    self._set_q(row)
+                    candidate = self._errors(targets[frame], valid[frame])
+                    candidate_weights = np.sqrt(self.task_weights[valid[frame]])[
+                        :, None
+                    ]
+                    candidate_objective = float(
+                        np.sum((candidate_weights * candidate) ** 2)
+                    ) + self.config.regularization * float(
+                        np.sum(
+                            (row[self.variable_columns] - seed[self.variable_columns])
+                            ** 2
+                        )
+                    )
+                    if candidate_objective < current_objective - 1.0e-16:
+                        accepted = True
+                        break
+                if not accepted:
+                    row[self.variable_columns] = current
+                    break
+            self._set_q(row)
+            final = self._errors(targets[frame], valid[frame])
+            final_norms = np.linalg.norm(final, axis=1)
+            report.final_errors_m.extend(final_norms)
+            if float(np.max(final_norms)) <= self.config.tolerance_m:
+                report.converged_frames += 1
+            report.joint_shifts.extend(
+                np.abs(row[self.variable_columns] - seed[self.variable_columns])
+            )
+        return output, report
+
+
+__all__ = [
+    "MujocoKeypointProjectionConfig",
+    "MujocoKeypointProjectionReport",
+    "MujocoKeypointProjector",
+    "MujocoKeypointRetargeter",
+    "MujocoPositionTaskSpec",
+]

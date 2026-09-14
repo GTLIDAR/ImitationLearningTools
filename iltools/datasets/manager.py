@@ -125,7 +125,7 @@ class ParallelTrajectoryManager:
     def __init__(
         self,
         *,
-        rb: TensorDictReplayBuffer,
+        rb: TensorDictReplayBuffer | None,
         traj_info: dict,
         num_envs: int,
         reset_schedule: str = ResetSchedule.RANDOM,
@@ -199,7 +199,9 @@ class ParallelTrajectoryManager:
         self._traj_rank_lookup = {
             traj: idx for idx, traj in enumerate(self._ordered_traj_list)
         }
-        sample_keys = {str(key) for key in self.rb[0].keys()}
+        sample_keys = (
+            {str(key) for key in self.rb[0].keys()} if self.rb is not None else set()
+        )
         self.has_next_reference = (
             "next_qpos" in sample_keys and "next_qvel" in sample_keys
         )
@@ -273,6 +275,43 @@ class ParallelTrajectoryManager:
         )
         self.root_ang_vel = torch.empty(
             self.num_envs, 3, device=self._state_device, dtype=torch.float32
+        )
+
+    @classmethod
+    def from_lengths(
+        cls,
+        lengths: Sequence[int] | Tensor,
+        *,
+        num_envs: int,
+        reset_schedule: str = ResetSchedule.RANDOM,
+        device: torch.device | str | None = None,
+        reset_generator: torch.Generator | None = None,
+    ) -> ParallelTrajectoryManager:
+        """Create a cursor-only manager for externally preloaded data."""
+
+        lengths_t = torch.as_tensor(lengths, dtype=torch.int64)
+        if lengths_t.ndim != 1 or lengths_t.numel() == 0:
+            raise ValueError("lengths must be a non-empty 1D sequence.")
+        if torch.any(lengths_t <= 0):
+            raise ValueError("All trajectory lengths must be positive.")
+        end = torch.cumsum(lengths_t, dim=0)
+        start = torch.cat(
+            (torch.zeros(1, dtype=torch.int64, device=lengths_t.device), end[:-1])
+        )
+        traj_info = {
+            "start_index": start,
+            "end_index": end,
+            "ordered_traj_list": list(range(int(lengths_t.numel()))),
+        }
+        return cls(
+            rb=None,
+            traj_info=traj_info,
+            num_envs=num_envs,
+            reset_schedule=reset_schedule,
+            device=device,
+            reset_generator=reset_generator,
+            target_joint_names=("__cursor__",),
+            reference_joint_names=("__cursor__",),
         )
 
     @property

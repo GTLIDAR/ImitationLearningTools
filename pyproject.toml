@@ -30,6 +30,19 @@ dependencies = [
 [project.optional-dependencies]
 loco-mujoco = ["loco-mujoco"]
 lerobot = ["lerobot"]
+soma = ["py-soma-x==0.2.1", "scipy", "trimesh"]
+sharpa = [
+    "pyarrow>=19",
+    "scipy>=1.13",
+    "pin==3.7.0",
+    "pin-pink==4.2.0",
+    # pin 3.7 links against urdfdom 4; the package's open >=4 bound can
+    # otherwise resolve to ABI-incompatible urdfdom 6.
+    "cmeel-urdfdom==4.0.1",
+    "cmeel-tinyxml2==10.0.0",
+    "qpsolvers>=4.4",
+    "daqp>=0.6.0",
+]
 
 [tool.pytest.ini_options]
 addopts = "-q"
